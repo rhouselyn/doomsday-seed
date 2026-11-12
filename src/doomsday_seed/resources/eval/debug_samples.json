@@ -1,0 +1,21 @@
+{
+  "version": "debug-1.0.0",
+  "note": "§5.1：Agent 只能用单独的调试样例，正式题集由项目版本管理且不可被 Agent 读取",
+  "cases": [
+    {
+      "id": "debug_ping",
+      "messages": [{"role": "user", "content": "请回复：调试就绪"}],
+      "expect": {"type": "contains_any", "values": ["调试就绪"]},
+      "max_tokens": 32
+    },
+    {
+      "id": "debug_chat_template",
+      "messages": [
+        {"role": "system", "content": "你是一个离线助手。"},
+        {"role": "user", "content": "用一句中文说明你能离线工作。"}
+      ],
+      "expect": {"type": "contains_any", "values": ["离线"]},
+      "max_tokens": 64
+    }
+  ]
+}

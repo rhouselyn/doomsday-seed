@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>末日种子</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+  <header class="masthead">
+    <div class="header-inner frame">
+      <a class="brand" href="#/vault" data-view="vault"><span class="seed-mark" aria-hidden="true"><i></i></span><span>末日种子<small>个人 AI 种子库</small></span></a>
+      <nav class="navigation" aria-label="主导航">
+        <a href="#/library" data-view="library" aria-current="page">模型库</a>
+        <a href="#/lab" data-view="lab">试用</a>
+        <a href="#/settings" data-view="settings">配置</a>
+      </nav>
+      <div class="utility"><span class="connection"><i aria-hidden="true"></i><span id="connectionText" role="status">连接本机</span></span></div>
+    </div>
+  </header>
+  <main id="main" tabindex="-1">
+
+    <!-- 首页 · 只有背景、说明和两个入口 -->
+    <section id="view-vault" aria-labelledby="vaultTitle">
+      <div class="hero">
+        <img class="hero-image" src="/assets/vault.webp" width="1536" height="1024" fetchpriority="high" alt="冰岛雪原上的种子库入口，近处的样本舱里长着一株幼苗">
+        <div class="hero-inner frame"><div class="hero-copy">
+          <p class="section-tag"><span></span>本地 AI 档案站</p>
+          <h1 id="vaultTitle" tabindex="-1">为断网之后，<br>留下一粒种子</h1>
+          <p>选好想保留的模型类型，发现、下载、校验和试用都在本机完成。断网以后，它们仍然能运行。</p>
+          <div class="hero-cta">
+            <a class="button primary" href="#/library" data-view="library">进入模型库</a>
+            <a class="button outline" href="#/lab" data-view="lab">试用本地模型</a>
+          </div>
+          <p id="homeStatus" class="home-status" role="status">正在检查本机种子库…</p>
+        </div></div>
+      </div>
+    </section>
+
+    <!-- 模型库 · 待探索 / 待下载 / 已落库 -->
+    <section id="view-library" class="frame screen library-screen" aria-labelledby="libraryTitle" hidden>
+      <h1 id="libraryTitle" class="sr-only" tabindex="-1">模型库</h1>
+      <p id="libraryStatus" class="library-status" role="status">正在读取种子库</p>
+      <div id="librarySections" class="library-sections"><p class="placeholder">正在读取目录…</p></div>
+    </section>
+
+    <!-- 试用 · 直接展示功能 -->
+    <section id="view-lab" class="frame screen lab-screen" aria-labelledby="labTitle" hidden>
+      <h1 id="labTitle" class="sr-only" tabindex="-1">试用本地模型</h1>
+      <div class="lab-layout">
+        <nav id="labTasks" class="lab-types" aria-label="试用类型"></nav>
+        <section class="console" aria-label="试用区">
+          <div class="console-head lab-console-head">
+            <div class="console-title"><h2 id="labTaskTitle">通用对话</h2><p id="labTaskHint" class="muted"></p></div>
+            <div class="lab-controls">
+              <div id="labModelWrap" hidden><label>模型<select id="labModel" disabled></select></label></div>
+              <button id="newChat" class="button quiet" type="button" hidden>新对话</button>
+            </div>
+          </div>
+          <div id="labEmpty" class="lab-empty"><span class="seed-mark" aria-hidden="true"><i></i></span><h2 id="labEmptyTitle">等候种子</h2><p id="labEmptyText">正在检查本机可用版本。</p><a class="button outline" href="#/library" data-view="library">去模型库下载</a></div>
+          <div id="chatPanel" hidden>
+            <div id="chatLog" class="chat-log" role="log" aria-label="对话记录" tabindex="0"></div>
+            <form id="chatForm" class="composer">
+              <label class="sr-only" for="chatInput">输入消息</label>
+              <textarea id="chatInput" rows="3" placeholder="写下你想问的问题" required></textarea>
+              <div class="composer-actions"><button id="stopChat" class="button outline" type="button" hidden>停止接收</button><button id="sendChat" class="button primary send" type="submit">发送</button></div>
+            </form>
+          </div>
+          <form id="mediaForm" class="media-form" hidden>
+            <label class="media-drop" for="mediaFile"><strong>选择一张本地图片</strong><span>PNG、JPEG 或 WebP，最大 8 MiB，识别结果叠加在原图上</span><span id="mediaName" class="media-name">未选择文件</span><input id="mediaFile" type="file" accept="image/png,image/jpeg,image/webp" required></label>
+            <canvas id="mediaPreview" aria-label="图片及识别出的关键点" hidden></canvas>
+            <button id="runMedia" class="button primary" type="submit" disabled>识别关键点</button>
+          </form>
+          <div id="runInfo" class="console-foot" role="status">本地会话</div>
+        </section>
+      </div>
+    </section>
+
+    <!-- 配置 · 模型服务 / 更新 / 保存位置 / 下载偏好 -->
+    <section id="view-settings" class="frame screen settings-screen" aria-labelledby="settingsTitle" hidden>
+      <h1 id="settingsTitle" class="sr-only" tabindex="-1">配置</h1>
+      <div class="settings-grid">
+        <section class="settings-card" aria-labelledby="serviceHeading">
+          <header class="settings-head"><h2 id="serviceHeading">模型服务</h2><span id="serviceMode" class="status"></span></header>
+          <p class="settings-note">可选。填写后，自动挑选候选时会参考这个模型服务的建议；留空则使用内置规则。</p>
+          <p id="localEndpoint" class="settings-note path-line"></p>
+          <form id="serviceForm" class="settings-form">
+            <label>API Key<input id="agentKey" type="password" autocomplete="off" spellcheck="false" placeholder="输入密钥；已保存时留空保持不变" maxlength="1024"></label>
+            <button id="removeAgentKey" type="button" class="text-link" hidden>移除已保存的密钥</button>
+            <label>调用链接<input id="agentBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="兼容 OpenAI 的地址；留空使用默认服务" maxlength="500"></label>
+            <label>模型名称<input id="agentModel" type="text" autocomplete="off" spellcheck="false" placeholder="留空使用默认模型" maxlength="120"></label>
+            <div class="settings-actions"><button class="button primary" type="submit">保存并测试</button><span id="serviceStatus" class="muted" role="status"></span></div>
+          </form>
+        </section>
+
+        <section class="settings-card" aria-labelledby="updateHeading">
+          <header class="settings-head"><h2 id="updateHeading">更新</h2><span id="updateBadge" class="status"></span></header>
+          <p class="settings-note">按日检查公开来源；下载和校验仍在后台按偏好进行。</p>
+          <form id="updateForm" class="settings-form">
+            <label class="switch"><input id="autoUpdate" type="checkbox"><span>每天自动检查更新</span></label>
+            <label>更新时间<input id="scheduleTime" type="time" step="60"></label>
+            <div class="settings-actions"><button class="button primary" type="submit">保存更新设置</button><button id="manualSync" class="button outline" type="button">立即更新</button></div>
+          </form>
+          <p id="syncStatus" class="settings-note" role="status"></p>
+          <p id="scheduleStatus" class="settings-note"></p>
+        </section>
+
+        <section class="settings-card" aria-labelledby="storageHeading">
+          <header class="settings-head"><h2 id="storageHeading">保存位置</h2><span id="storageBadge" class="status"></span></header>
+          <p class="settings-note">模型下载完成后放到的本地目录。更改后，已有模型会一起移动；有任务进行中时需先等它完成。</p>
+          <form id="storageForm" class="settings-form">
+            <label>本地路径<input id="downloadRoot" type="text" autocomplete="off" spellcheck="false" placeholder="留空使用默认目录" maxlength="500"></label>
+            <div class="settings-actions"><button class="button primary" type="submit">保存位置</button><button id="resetPath" class="button quiet" type="button">恢复默认</button><span id="pathStatus" class="muted" role="status"></span></div>
+          </form>
+          <p id="seedsDir" class="settings-note path-line"></p>
+        </section>
+
+        <section class="settings-card wide" aria-labelledby="preferenceHeading">
+          <header class="settings-head"><h2 id="preferenceHeading">下载偏好</h2><span id="preferenceCount" class="status"></span></header>
+          <p class="settings-note">每个类型默认勾选平衡。勾选“自动”后按所选档位准备；“SOTA”单独收藏公开领先版本，不影响本机档位。</p>
+          <div id="preferenceRows" class="pref-table"></div>
+          <div class="settings-actions pref-actions"><button id="savePreferences" class="button primary" type="button">保存偏好</button><span id="preferenceStatus" class="muted" role="status"></span></div>
+        </section>
+      </div>
+    </section>
+  </main>
+  <footer class="footer"><div class="frame"><span>末日种子</span><span>权重和试用留在本机</span></div></footer>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

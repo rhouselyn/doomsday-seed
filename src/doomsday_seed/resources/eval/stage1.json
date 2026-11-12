@@ -1,0 +1,80 @@
+{
+  "version": "stage1-1.0.0",
+  "task": "chat",
+  "name": "阶段 1 通用对话回归筛查",
+  "scope": "少量自有样本（短中文问答、信息提取、格式遵循）；只说明这些用例上的表现",
+  "gates": {
+    "min_quality": 0.7,
+    "min_passed_cases": 6,
+    "max_wait_ms": 30000
+  },
+  "protocol": {
+    "context": 2048,
+    "concurrency": 1,
+    "warmup": 1,
+    "repeats": 3,
+    "cold_start_separate": true,
+    "median_of_repeats": true,
+    "note": "固定输入，冷启动单独计时，预热后多次取中位数；公开原始精度成绩不得挪给量化版"
+  },
+  "target_latency_ms": 6000,
+  "max_wait_ms": 30000,
+  "cases": [
+    {
+      "id": "zh_qa_1",
+      "category": "短中文问答",
+      "messages": [{"role": "user", "content": "中国的首都是哪座城市？请只回答城市名。"}],
+      "expect": {"type": "contains_any", "values": ["北京"]},
+      "max_tokens": 64
+    },
+    {
+      "id": "zh_math_1",
+      "category": "短中文问答",
+      "messages": [{"role": "user", "content": "一加一等于几？只回答数字。"}],
+      "expect": {"type": "contains_any", "values": ["2", "二", "两"]},
+      "max_tokens": 64
+    },
+    {
+      "id": "extract_id",
+      "category": "信息提取",
+      "messages": [{"role": "user", "content": "文本：李明在杭州工作，工号 A-17。请只回答工号。"}],
+      "expect": {"type": "contains_any", "values": ["A-17"]},
+      "max_tokens": 64
+    },
+    {
+      "id": "json_format",
+      "category": "格式遵循",
+      "messages": [{"role": "user", "content": "请只输出 JSON，包含 ok 与 lang 两个键，ok 为 true，lang 为 zh。"}],
+      "expect": {"type": "json_format", "keys": ["ok", "lang"]},
+      "max_tokens": 96
+    },
+    {
+      "id": "extract_time",
+      "category": "事实提取",
+      "messages": [{"role": "user", "content": "文本：同步时间为每天 03:00。同步时间是几点？只回答时间。"}],
+      "expect": {"type": "contains_any", "values": ["03:00"]},
+      "max_tokens": 64
+    },
+    {
+      "id": "translate",
+      "category": "中英指令",
+      "messages": [{"role": "user", "content": "把「种子库」翻译成英文，只回答英文。"}],
+      "expect": {"type": "contains_any", "values": ["seed", "Seed"]},
+      "max_tokens": 64
+    },
+    {
+      "id": "list_format",
+      "category": "结构化输出",
+      "messages": [{"role": "user", "content": "请输出一行列表：苹果、香蕉、橙子。用顿号分隔，不要解释。"}],
+      "expect": {"type": "contains_all", "values": ["苹果", "香蕉", "橙子"]},
+      "max_tokens": 96
+    },
+    {
+      "id": "en_exact",
+      "category": "格式遵循",
+      "messages": [{"role": "user", "content": "Reply with exactly: OFFLINE READY"}],
+      "expect": {"type": "exact", "value": "OFFLINE READY"},
+      "max_tokens": 32
+    }
+  ]
+}
