@@ -8,29 +8,26 @@
 from __future__ import annotations
 
 import json
-import os
-import re
-import threading
-import time
 import uuid
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 from .agent import AgentGateway
-from .archive import (build_manifest, compute_completeness, usage_markdown,
+from .archive import (build_manifest, compute_completeness, usage_markdown, verify_seed,
                       write_manifest, write_usage)
 from .catalog import load_eval_config, meets_gates, promote, sota_leaders
 from .config import Paths
 from .db import Database
 from .debug_tools import DebugToolbox
-from .discovery import DiscoveryResult, HuggingFaceSource, LICENSE_ALLOWLIST, local_adapter
-from .downloader import DownloadError, DownloadPlan, Downloader, resolve_fixed_commit
+from .discovery import HuggingFaceSource, LICENSE_ALLOWLIST, local_adapter
+from .downloader import DownloadError, DownloadPlan, Downloader
 from .evaluation import Evaluator
-from .hardware import probe as probe_hardware
-from .models import (PROFILES, Candidate, EvaluationRecord, HardwareSample, Job, RuntimeConfig,
-                     Seed, Settings, SyncReport, utc_now)
+from .locks import LockBusy, file_lock
+from .hardware import check_capacity, estimate_footprint, probe as probe_hardware
+from .models import (PROFILES, Candidate, EvaluationRecord, FileSpec, HardwareSample, Job, RuntimeConfig,
+                     Seed, SyncReport, utc_now)
 from .preselect import PreSelector, ShortlistResult
 from .runner import InferenceService, RuntimeUnavailable
 from .runtime_registry import RuntimeRegistry
@@ -39,40 +36,6 @@ from . import media
 
 class SyncBusy(Exception):
     pass
-
-
-class SyncLock:
-    """应用层同一把同步锁：手动触发与计划任务冲突时明确跳过。"""
-
-    def __init__(self, paths: Paths, db: Database, stale_seconds: float = 7200):
-        self.path = paths.sync_lock
-        self.db = db
-        self.stale_seconds = stale_seconds
-        self._thread_lock = threading.Lock()
-
-    @contextmanager
-    def hold(self, trigger: str = "manual"):
-        acquired = self._thread_lock.acquire(blocking=False)
-        if not acquired:
-            raise SyncBusy("已有同步正在运行，同一计划忽略重复实例")
-        try:
-            if self.path.exists():
-                try:
-                    data = json.loads(self.path.read_text(encoding="utf-8"))
-                    age = time.time() - float(data.get("ts", 0))
-                    if age < self.stale_seconds:
-                        raise SyncBusy(f"同步锁被占用（{data.get('trigger', 'unknown')}，{age:.0f} 秒前）")
-                except (ValueError, TypeError):
-                    pass
-                self.path.unlink(missing_ok=True)
-            self.path.write_text(json.dumps({"ts": time.time(), "pid": os.getpid(),
-                                             "trigger": trigger}), encoding="utf-8")
-            try:
-                yield
-            finally:
-                self.path.unlink(missing_ok=True)
-        finally:
-            self._thread_lock.release()
 
 
 @dataclass
@@ -100,8 +63,7 @@ class JobPipeline:
         self.evaluator = evaluator
         self.inference = inference
         self.gateway = gateway
-        self.sync_lock = SyncLock(paths, db)
-        self._workers: list[threading.Thread] = []
+        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='seed-jobs')
         self._last_report: SyncReport | None = None
 
     def hardware(self) -> HardwareSample:
@@ -112,7 +74,7 @@ class JobPipeline:
         report = SyncReport(id=uuid.uuid4().hex[:16], trigger=trigger)
         self.db.start_sync(report)
         try:
-            with self.sync_lock.hold(trigger):
+            with file_lock(self.paths.sync_lock):
                 settings = self.db.get_settings()
                 if settings.simulated_offline:
                     report.status = "skipped"
@@ -188,10 +150,10 @@ class JobPipeline:
                 self.db.set_meta("last_sync_attempt", utc_now())
                 self.db.set_meta("last_sync_status", report.status)
                 self.db.set_meta("last_sync_skip_reason", json.dumps(report.skipped[:5], ensure_ascii=False))
-                if not job_ids:
+                if not job_ids and report.status == "ok":
                     self.db.set_meta("last_sync_success", utc_now())
                 self._start_worker(job_ids, wait=wait, report=report)
-        except SyncBusy as exc:
+        except (SyncBusy, LockBusy) as exc:
             report.status = "skipped"
             report.message = str(exc)
             report.skipped.append({"reason": str(exc)})
@@ -235,26 +197,52 @@ class JobPipeline:
     def _start_worker(self, job_ids: list[str], wait: bool, report: SyncReport | None = None) -> None:
         if not job_ids:
             return
-        target = lambda: self._run_jobs(job_ids, report)
         if wait:
-            target()
+            self._run_jobs(job_ids, report)
         else:
-            thread = threading.Thread(target=target, daemon=True, name="doomsday-jobs")
-            self._workers.append(thread)
-            thread.start()
+            self._worker.submit(self._run_jobs, job_ids, report)
+
+    def shutdown(self) -> None:
+        self._worker.shutdown(wait=True, cancel_futures=True)
+
+    @contextmanager
+    def library_lock(self, *, wait=False):
+        with file_lock(self.paths.data / "library.lock", wait=wait):
+            configured = self.db.get_settings().download_root
+            if configured != self.paths.download_root:
+                self.paths.set_download_root(configured)
+            yield
 
     def _run_jobs(self, job_ids: list[str], report: SyncReport | None = None) -> None:
         # 单次只加载一个模型：作业串行执行，后台评测由资源锁排队。
+        results = []
         for job_id in job_ids:
-            self.run_job(job_id)
+            try:
+                results.append(self.run_job(job_id))
+            except Exception as exc:
+                results.append(self._fail(job_id, "failed", str(exc), None))
         if report:
-            self.db.set_meta("last_sync_success", utc_now())
+            incomplete = [r for r in results if r.state != "done"]
+            if incomplete:
+                report.status = "partial" if len(incomplete) < len(results) else "failed"
+                report.message = "；".join(r.message for r in incomplete)[:1000]
+            elif report.status == "ok":
+                self.db.set_meta("last_sync_success", utc_now())
+            report.finished_at = utc_now()
+            self.db.set_meta("last_sync_status", report.status)
+            self.db.finish_sync(report)
 
     def recover(self) -> list[str]:
-        jobs = self.db.recover_jobs()
+        try:
+            with self.library_lock():
+                jobs = self.db.recover_jobs()
+        except LockBusy:
+            jobs = self.db.list_jobs(state="queued", limit=-1)
         return [j.id for j in jobs]
 
     def run_pending(self) -> None:
+        if self.db.get_settings().simulated_offline:
+            return
         job_ids = self.recover()
         if job_ids:
             self._start_worker(job_ids, wait=False)
@@ -272,12 +260,19 @@ class JobPipeline:
             raise ValueError("所选能力或档位暂不可用")
         if candidate.license not in LICENSE_ALLOWLIST:
             raise ValueError("许可尚未确认或不符合下载规则")
+        try:
+            candidate = self.source.pin(candidate)
+        except Exception as exc:
+            raise ValueError(f"无法确认固定版本的文件清单：{exc}") from exc
+        if candidate.state == "gated" or candidate.task != task or candidate.license not in LICENSE_ALLOWLIST:
+            raise ValueError("固定版本的能力、访问权限或许可不符合下载规则")
         adapter = local_adapter(candidate)
         if mode == "local" and not adapter:
-            raise ValueError("此版本暂不支持本机试用")
+            raise ValueError("固定版本暂不支持本机试用")
         if mode == "sota" and candidate.id not in sota_leaders(self.db.list_candidates(task=task)):
-            raise ValueError("此版本目前没有可用于 SOTA 收藏的领先记录")
-        config = RuntimeConfig(adapter=adapter or "archive-only")
+            raise ValueError("固定版本没有可用于 SOTA 收藏的领先记录")
+        config = RuntimeConfig(adapter=adapter or "archive-only",
+                               mmproj=next((f.local_path for f in candidate.files if f.kind == "projection"), None))
         plan = DownloadPlan(candidate_id=candidate.id, repo=candidate.repo,
                             commit_rev=candidate.commit_rev, files=candidate.files,
                             runtime_config=config, total_bytes=candidate.size_bytes)
@@ -313,9 +308,15 @@ class JobPipeline:
         return update
 
     def run_job(self, job_id: str) -> JobResult:
+        with self.library_lock(wait=True):
+            return self._run_job(job_id)
+
+    def _run_job(self, job_id: str) -> JobResult:
         job = self.db.get_job(job_id)
         if job is None or job.state != "queued":
             return JobResult(job_id, job.state if job else "missing", "作业无需执行")
+        if job.kind != "local_import" and self.db.get_settings().simulated_offline:
+            return JobResult(job_id, "queued", "模拟模式已暂停下载")
         claim = self.db.execute("UPDATE jobs SET state='downloading', stage='下载', updated_at=? "
                                 "WHERE id=? AND state='queued'", (utc_now(), job_id))
         if not claim.rowcount:
@@ -323,7 +324,10 @@ class JobPipeline:
         if job.kind == "local_import":
             from .local_import import run
             return run(self, job)
-        plan = DownloadPlan(**job.payload["plan"])
+        try:
+            plan = DownloadPlan(**job.payload["plan"])
+        except (KeyError, TypeError, ValueError) as exc:
+            return self._fail(job_id, "failed", f"下载计划无效：{exc}", None)
         assignments = job.payload.get("assignments", [])
         archive_only = job.payload.get("mode") in {"sota", "requested"}
         candidate = self.db.get_candidate(plan.candidate_id)
@@ -335,11 +339,47 @@ class JobPipeline:
             # 排队 → 下载
             self.db.update_job(job_id, state="downloading", stage="下载", progress=0.05,
                                message="下载预检：固定 commit、精确文件清单、落盘空间")
-            if candidate.source != "mediapipe" and not re.fullmatch(r"[0-9a-f]{7,40}", plan.commit_rev or ""):
-                plan.commit_rev = resolve_fixed_commit(plan.repo, plan.commit_rev)
+            if candidate.source == "huggingface":
+                try:
+                    fixed = self.source.pin(candidate, plan.commit_rev)
+                except Exception as exc:
+                    raise DownloadError(f"无法确认固定版本的文件清单：{exc}", "network") from exc
+                if fixed.state == "gated" or fixed.license not in LICENSE_ALLOWLIST:
+                    raise DownloadError("固定版本的访问权限或许可不符合规则", "other")
+                if fixed.task != candidate.task:
+                    raise DownloadError("固定版本的任务类型已改变，请重新选择", "other")
+                if fixed.id != candidate.id:
+                    existing = self.db.query_one("SELECT id FROM jobs WHERE idempotency_key=?", (fixed.idempotency_key,))
+                    if existing and existing["id"] != job_id:
+                        duplicate = self.db.get_job(existing["id"])
+                        message = f"固定版本已有作业：{duplicate.id}"
+                        state = "done" if duplicate.state == "done" else "failed"
+                        self.db.update_job(job_id, state=state, stage=state, message=message,
+                                           payload={**job.payload, "replacement_job": duplicate.id})
+                        return JobResult(job_id, state, message)
+                    candidate = fixed
+                    plan.candidate_id = fixed.id
+                    plan.commit_rev = fixed.commit_rev
+                    plan.files = fixed.files
+                    plan.runtime_config.mmproj = next((f.local_path for f in plan.files if f.kind == "projection"), None)
+                    job.payload["plan"] = plan.model_dump()
+                    with self.db.transaction():
+                        self.db.execute("UPDATE jobs SET candidate_id=?, idempotency_key=? WHERE id=?",
+                                        (fixed.id, fixed.idempotency_key, job_id))
+                        self.db.update_job(job_id, payload=job.payload)
+                if fixed.files != plan.files:
+                    plan.files = fixed.files
+                    plan.runtime_config.mmproj = next((f.local_path for f in plan.files if f.kind == "projection"), None)
+                    job.payload["plan"] = plan.model_dump()
+                    self.db.update_job(job_id, payload=job.payload)
             archived = self.db.find_seed_by_candidate(candidate.id)
             reuse = archived and archived.integrity == "ok" and archived.manifest["source"]["fixed_revision"] == plan.commit_rev
-            preflight = self.downloader.preflight(plan, job_id)
+            if reuse:
+                plan.files = [FileSpec(repo_path=f["source_path"], local_path=f["relative_path"],
+                                       size_bytes=f["size_bytes"], kind=f["kind"],
+                                       sha256=f.get("sha256"), upstream_sha256=f.get("upstream_sha256"))
+                              for f in archived.manifest["sizes_and_hashes"]]
+            preflight = self.downloader.preflight(plan, job_id, reuse=bool(reuse))
             if not preflight.ok:
                 raise DownloadError("；".join(preflight.reasons), "resource")
             staging = self.downloader.staging_dir(job_id)
@@ -364,7 +404,8 @@ class JobPipeline:
                         media.prepare(self.paths)
                     except Exception as exc:
                         raise DownloadError("动作环境暂不可用，已保留权重", "network") from exc
-                    media.smoke(self.paths, candidate.task, files_dir / candidate.variant)
+                    with self.inference.reserve(f"smoke-{job_id}"):
+                        media.smoke(self.paths, candidate.task, files_dir / candidate.variant)
                 return self._store_simple(job, candidate, plan, files_dir, verification, ready, bool(reuse))
 
             # 调试（Agent 只操作暂存区与回环服务）
@@ -374,14 +415,24 @@ class JobPipeline:
                 try:
                     self.registry.prepare_cpu()
                 except Exception as exc:
-                    raise DownloadError("对话环境暂不可用，已保留权重", "network") from exc
+                    if not self.registry.command("cuda"):
+                        raise DownloadError("对话环境暂不可用，已保留权重", "network") from exc
                 current = self.hardware()
                 self.db.save_sample(current)
                 backend = "cuda" if current.backend_available.get("cuda") else "cpu"
-                plan.runtime_config = RuntimeConfig(backend=backend, runner_version=self.registry.version(),
-                                                    gpu_layers=99 if backend == "cuda" else 0)
+                plan.runtime_config.backend = backend
+                plan.runtime_config.runner_version = self.registry.version(backend)
+                plan.runtime_config.gpu_layers = 99 if backend == "cuda" else 0
+                plan.runtime_config.mmproj = next((f.local_path for f in plan.files if f.kind == "projection"), None)
+                weight_bytes = sum(f.size_bytes for f in plan.files if f.kind == "weight")
+                projection_bytes = sum(f.size_bytes for f in plan.files if f.kind == "projection")
+                estimate = estimate_footprint(weight_bytes, projection_bytes=projection_bytes,
+                                               backend=backend, gpu_layers=plan.runtime_config.gpu_layers)
+                capacity = check_capacity(estimate, current, backend)
+                if not capacity["fits"]:
+                    raise DownloadError(capacity["reason"], "resource")
             tuned, diagnostics = self.debug_box.run_debug(
-                job_id, plan, plan.runtime_config, self.gateway)
+                job_id, plan, plan.runtime_config, self.gateway, files_dir)
             if diagnostics.get("pending_adaptation"):
                 reason = f"待适配：{diagnostics.get('error', '缺少受控运行器或适配器')}"
                 self.db.set_candidate_state(candidate.id, "unsupported", reason)
@@ -402,36 +453,12 @@ class JobPipeline:
             self.db.update_job(job_id, state="retesting", stage="复测", progress=0.92,
                                message="写入 manifest.json 与 USAGE.md")
             plan.runtime_config = tuned
-            offline_check = evaluation.detail.get("offline_check", {})
-            manifest = build_manifest(
-                seed_id=candidate.id, candidate=candidate, plan=plan,
-                verification=verification, runtime_config=tuned, evaluation=evaluation,
-                hardware=self.hardware(), offline_check=offline_check)
-            write_manifest(files_dir, manifest)
-            write_usage(files_dir, usage_markdown(manifest=manifest, candidate=candidate,
-                                                  evaluation=evaluation,
-                                                  offline_check=offline_check))
-            seed_dir = files_dir if reuse else self.downloader.promote(job_id, candidate.id)
-            completeness, missing = compute_completeness(seed_dir, manifest)
-            gates_ok, gates_reason = meets_gates(evaluation, load_eval_config())
-            offline_ready = bool(evaluation.offline_ok and gates_ok and not missing)
-            seed = Seed(id=candidate.id, candidate_id=candidate.id,
-                        rel_dir=candidate.id, manifest=manifest,
-                        completeness=completeness, offline_ready=offline_ready,
-                        integrity="ok" if not missing else "incomplete")
-
-            with self.db.transaction() as _conn:
-                self.db.put_seed(seed)
-                if offline_ready:
-                    self.db.set_candidate_state(candidate.id, "offline_ready",
-                                                "断网启动与任务样例通过，离线可用")
-                else:
-                    self.db.set_candidate_state(
-                        candidate.id, "downloaded",
-                        f"文件已下载，正在验证离线启动。（{gates_reason}）")
+            seed, _ = self._save_evaluation(candidate, plan, files_dir, verification,
+                                                       evaluation, None if reuse else job_id)
+            offline_ready = seed.offline_ready
             promoted = self._update_defaults(candidate.id, evaluation, assignments) if offline_ready else []
             message = ("离线可用，已归档" if offline_ready else
-                       "复测未过线，已归档为「已下载 · 待验证」，默认指针不变")
+                       "复测未过线，已归档为「已下载 · 待验证」")
             if promoted:
                 message += "；默认版本：" + "、".join(promoted)
             self.db.update_job(job_id, state="done", stage="完成", progress=1.0,
@@ -456,6 +483,111 @@ class JobPipeline:
             if current and current.state == "done":
                 self.downloader.cleanup(job_id)
 
+    def _save_evaluation(self, candidate, plan, directory, verification, evaluation, job_id=None,
+                         seed_id=None, rel_dir=None):
+        seed_id = seed_id or candidate.id
+        rel_dir = rel_dir or candidate.id
+        plan.runtime_config.backend = evaluation.backend
+        plan.runtime_config.runner_version = evaluation.runner_version
+        if evaluation.backend == "cpu":
+            plan.runtime_config.gpu_layers = 0
+        offline_check = evaluation.detail.get("offline_check", {})
+        manifest = build_manifest(
+            seed_id=seed_id, candidate=candidate, plan=plan, verification=verification,
+            runtime_config=plan.runtime_config, evaluation=evaluation,
+            hardware=self.hardware(), offline_check=offline_check)
+        write_usage(directory, usage_markdown(manifest=manifest, candidate=candidate,
+                                              evaluation=evaluation, offline_check=offline_check))
+        write_manifest(directory, manifest)
+        reserve = self.inference.reserve(f"promote-{job_id}") if job_id else nullcontext()
+        promote_files = self.downloader.promote(job_id, seed_id) if job_id else nullcontext(directory)
+        with reserve, promote_files as seed_dir:
+            ratio, missing = compute_completeness(seed_dir, manifest)
+            gates_ok, reason = meets_gates(evaluation, load_eval_config())
+            seed = Seed(id=seed_id, candidate_id=candidate.id, rel_dir=rel_dir, manifest=manifest,
+                        completeness=ratio, offline_ready=gates_ok and not missing,
+                        integrity="ok" if not missing else "incomplete")
+            self._save_seed(seed, reason)
+        return seed, reason
+
+    def _save_seed(self, seed: Seed, reason: str) -> None:
+        with self.db.transaction():
+            self.db.put_seed(seed)
+            self.db.set_candidate_state(seed.candidate_id,
+                                        "offline_ready" if seed.offline_ready else "downloaded", reason)
+            if not seed.offline_ready:
+                for pointer in self.db.list_defaults():
+                    if pointer.seed_id != seed.id:
+                        continue
+                    previous = self.db.get_seed(pointer.previous_seed_id) if pointer.previous_seed_id else None
+                    if (previous and previous.id != seed.id and previous.offline_ready
+                            and previous.integrity == "ok" and previous.manifest.get("task", "chat") == pointer.task):
+                        pointer.seed_id = previous.id
+                    else:
+                        pointer.seed_id = None
+                    pointer.previous_seed_id = seed.id
+                    pointer.pinned = False
+                    pointer.source = "auto"
+                    self.db.set_default(pointer)
+
+    def retest(self, seed_id: str) -> dict:
+        with self.library_lock(wait=True):
+            seed = self.db.get_seed(seed_id)
+            if not seed:
+                raise ValueError(f"种子不存在：{seed_id}")
+            manifest = seed.manifest
+            directory = self.paths.seeds / seed.rel_dir
+            ok, missing, mismatched = verify_seed(directory, manifest)
+            if not ok:
+                seed.integrity = "incomplete"
+                seed.offline_ready = False
+                self._save_seed(seed, "归档完整性校验失败")
+                return {"ok": False, "seed_id": seed_id, "errors": missing + mismatched}
+            source = manifest.get("source", {})
+            config = RuntimeConfig(**manifest.get("runtime_config", {}))
+            if config.adapter not in {"llamacpp-openai", "mediapipe"}:
+                raise ValueError("此归档尚未接入本机试用适配器")
+            files = [FileSpec(repo_path=f["source_path"], local_path=f["relative_path"],
+                              size_bytes=f["size_bytes"], kind=f["kind"], sha256=f["sha256"],
+                              upstream_sha256=f.get("upstream_sha256")) for f in manifest["sizes_and_hashes"]]
+            candidate = self.db.get_candidate(seed.candidate_id)
+            if candidate is None:
+                candidate = Candidate(id=seed.candidate_id or seed.id, source=source["name"],
+                                      repo=source["repo"], commit_rev=source["fixed_revision"],
+                                      variant=manifest["variant"], task=manifest["task"],
+                                      license=source.get("license", ""), publisher=source.get("publisher", ""),
+                                      files=files, size_bytes=sum(f.size_bytes for f in files))
+                candidate = self.db.upsert_candidate(candidate)
+                seed.candidate_id = candidate.id
+            plan = DownloadPlan(candidate_id=candidate.id, repo=candidate.repo, commit_rev=source["fixed_revision"],
+                                files=files, runtime_config=config)
+            if config.adapter == "mediapipe":
+                try:
+                    weight = next(f.local_path for f in files if f.kind == "weight")
+                    with self.inference.reserve(f"retest-{seed_id}"):
+                        media.smoke(self.paths, candidate.task, directory / weight)
+                except Exception as exc:
+                    seed.offline_ready = False
+                    reason = str(exc)
+                else:
+                    seed.offline_ready = True
+                    reason = "本地进程空图检查通过"
+                manifest["offline_verification"] = {"passed": seed.offline_ready, "method": reason}
+                seed.integrity = "ok"
+                write_manifest(directory, manifest)
+                self._save_seed(seed, reason)
+                return {"ok": seed.offline_ready, "seed_id": seed_id, "reason": reason}
+
+            verification = {"files": [f.model_dump() for f in files],
+                            "total_bytes": sum(f.size_bytes for f in files)}
+            record = self.evaluator.evaluate(
+                candidate=candidate, staging_dir=directory, plan=plan, config=config, verification=verification,
+                real_drill=self.db.get_meta("real_drill") == "1")
+            saved, reason = self._save_evaluation(candidate, plan, directory, verification, record,
+                                                  seed_id=seed.id, rel_dir=seed.rel_dir)
+            return {"ok": saved.offline_ready, "seed_id": seed_id, "reason": reason,
+                    "evaluation": record.model_dump()}
+
     def _fail(self, job_id: str, state: str, message: str,
               candidate: Candidate | None) -> JobResult:
         self.db.update_job(job_id, state=state, stage=state, message=message[:1000])
@@ -469,7 +601,7 @@ class JobPipeline:
         return JobResult(job_id, state, message)
 
     def _store_simple(self, job, candidate, plan, directory, verification, ready, reuse) -> JobResult:
-        mode = "local" if ready else "sota"
+        mode = "local" if ready else job.payload.get("mode", "requested")
         config = RuntimeConfig(adapter="mediapipe" if ready else "archive-only",
                                runner_version=media.VERSION if ready else "unregistered", verified=ready)
         check = {"passed": ready, "method": "本地进程空图检查" if ready else "仅校验收藏文件"}
@@ -486,10 +618,10 @@ class JobPipeline:
                        if ready else "权重与附件已校验收藏，尚未进行本机试用验证。")
                     + "\n\n" + "\n".join(manifest["external_references"]) + "\n")
         write_manifest(directory, manifest)
-        if not reuse:
-            self.downloader.promote(job.id, candidate.id)
+        reserve = nullcontext() if reuse else self.inference.reserve(f"promote-{job.id}")
+        promote_files = nullcontext() if reuse else self.downloader.promote(job.id, candidate.id)
         message = "离线可用" if ready else "已收藏 · 未在本机验证"
-        with self.db.transaction():
+        with reserve, promote_files, self.db.transaction():
             self.db.put_seed(Seed(id=candidate.id, candidate_id=candidate.id, rel_dir=candidate.id,
                                   manifest=manifest, completeness=1.0, integrity="ok", offline_ready=ready))
             self.db.set_candidate_state(candidate.id, "offline_ready" if ready else "downloaded", message)
@@ -512,9 +644,11 @@ class JobPipeline:
                 old_seed = self.db.get_seed(pointer.seed_id)
                 if old_seed:
                     records = [e for e in self.db.list_evaluations(
-                        candidate_id=old_seed.candidate_id, eval_version=config["version"])
-                        if e.hardware_fingerprint == evaluation.hardware_fingerprint]
+                        candidate_id=old_seed.candidate_id, eval_version=config["version"])]
                     current = records[0] if records else None
+                    if old_seed.offline_ready and old_seed.integrity == "ok" and current is None:
+                        self.db.set_meta(f"promotion_skip:{task}:{profile}", "现任版本需按当前评测口径重测")
+                        continue
             ok, reason = promote(current, evaluation, profile, config)
             if not ok:
                 self.db.set_meta(f"promotion_skip:{task}:{profile}", reason)

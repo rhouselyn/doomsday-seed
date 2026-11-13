@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -77,15 +78,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_hash TEXT PRIMARY KEY, label TEXT NOT NULL, created_at TEXT NOT NULL);
 """
 
-_JSON_FIELDS: dict[str, set[str]] = {
-    "candidates": {"files", "evidence", "estimate"},
-    "jobs": {"payload"},
-    "evaluations": {"params", "detail"},
-    "seeds": {"manifest"},
-    "sync_runs": {"detail"},
-}
-
-
 def _dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
@@ -105,6 +97,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._in_transaction = False
+        self._identity = uuid.uuid4().hex
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         with self._lock:
@@ -151,6 +144,11 @@ class Database:
             finally:
                 self._in_transaction = False
 
+    def revision(self) -> str:
+        with self._lock:
+            external = self.conn.execute("PRAGMA data_version").fetchone()[0]
+            return f"{self._identity}:{external}:{self.conn.total_changes}"
+
     def close(self) -> None:
         with self._lock:
             self.conn.close()
@@ -162,9 +160,11 @@ class Database:
         data = {r["key"]: _loads(r["value"], None) for r in rows if r["key"] in known}
         return Settings(**{k: v for k, v in data.items() if v is not None})
 
-    def put_settings(self, settings: Settings) -> Settings:
+    def put_settings(self, settings: Settings, *, update_download_root=False) -> Settings:
         with self.transaction() as conn:
             for key, value in settings.model_dump().items():
+                if key == "download_root" and not update_download_root:
+                    continue
                 conn.execute(
                     "INSERT INTO settings(key, value) VALUES(?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -239,8 +239,9 @@ class Database:
         existing = self.get_candidate(candidate.id)
         if existing:
             # 只覆盖元数据与预估，不回退已取得的归档状态。
-            candidate.state = existing.state
-            candidate.reason = existing.reason
+            if existing.state in ("downloaded", "offline_ready") and candidate.state != "gated":
+                candidate.state = existing.state
+                candidate.reason = existing.reason
             candidate.created_at = existing.created_at
         candidate.updated_at = utc_now()
         d = candidate.model_dump()
@@ -248,7 +249,7 @@ class Database:
             "INSERT INTO candidates(id, source, repo, commit_rev, variant, task, publisher, "
             "license, size_bytes, files, evidence, estimate, rationale, state, reason, "
             "created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET license=excluded.license, size_bytes=excluded.size_bytes, "
+            "ON CONFLICT(id) DO UPDATE SET task=excluded.task, license=excluded.license, size_bytes=excluded.size_bytes, "
             "files=excluded.files, evidence=excluded.evidence, estimate=excluded.estimate, "
             "rationale=excluded.rationale, state=excluded.state, reason=excluded.reason, "
             "updated_at=excluded.updated_at",
@@ -292,6 +293,7 @@ class Database:
     @staticmethod
     def _job_from_row(row: dict) -> Job:
         data = dict(row)
+        data["idempotency_key"] = data.get("idempotency_key") or ""
         data["payload"] = _loads(data.get("payload"), {})
         return Job(**data)
 
@@ -371,8 +373,8 @@ class Database:
              d["score_accuracy"], _dumps(d["detail"]), d["created_at"]))
 
     def list_evaluations(self, candidate_id: str | None = None,
-                         eval_version: str | None = None) -> list[EvaluationRecord]:
-        sql = "SELECT * FROM evaluations WHERE 1=1"
+                         eval_version: str | None = None, *, latest_only=False) -> list[EvaluationRecord]:
+        sql = "SELECT evaluations.*, rowid AS insertion_order FROM evaluations WHERE 1=1"
         params: list[Any] = []
         if candidate_id:
             sql += " AND candidate_id=?"
@@ -380,7 +382,12 @@ class Database:
         if eval_version:
             sql += " AND eval_version=?"
             params.append(eval_version)
-        sql += " ORDER BY created_at DESC"
+        if latest_only:
+            sql = ("SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY candidate_id "
+                   "ORDER BY created_at DESC, insertion_order DESC) AS position FROM (" + sql +
+                   ")) WHERE position=1 ORDER BY created_at DESC, insertion_order DESC")
+        else:
+            sql += " ORDER BY created_at DESC, rowid DESC"
         out = []
         for row in self.query(sql, params):
             data = dict(row)
@@ -404,7 +411,7 @@ class Database:
         self.execute(
             "INSERT INTO seeds(id, candidate_id, rel_dir, manifest, completeness, offline_ready, "
             "integrity, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(id) DO UPDATE SET manifest=excluded.manifest, "
+            "ON CONFLICT(id) DO UPDATE SET candidate_id=excluded.candidate_id, manifest=excluded.manifest, "
             "completeness=excluded.completeness, offline_ready=excluded.offline_ready, "
             "integrity=excluded.integrity, updated_at=excluded.updated_at",
             (d["id"], d["candidate_id"], d["rel_dir"], _dumps(d["manifest"]), d["completeness"],

@@ -7,15 +7,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import sqlite3
+import sys
+import tempfile
 import subprocess
 import zipfile
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .config import LOOPBACK_HOST, Paths
+from .config import Paths
 from .db import Database
+from .downloader import sha256_file
 
 RESTORE_TEXT = """# 末日种子 · 本地恢复说明
 
@@ -26,26 +32,25 @@ RESTORE_TEXT = """# 末日种子 · 本地恢复说明
 
 - 相容的操作系统（首版为 Windows 11 x64）、CPU 指令集；
   使用 CUDA 后端时还需要相容的 NVIDIA 显卡驱动。
-- Python 3.11+（与打包时的 ABI 相容）。锁定版本见 requirements.lock.txt。
-- 恢复说明里写明预先要备齐的安装件：如需系统解码器或原生库，见 runtimes/ 目录。
+- Python 3.11+（与打包时的 ABI 相容）。动作识别需要 Windows x64 / Python 3.13。
+- 手工登记的外部运行器需要在目标机器准备并重新登记。导出结果会列出未随包迁移的后端。
 
 ## 2. 离线安装
 
-```bash
-pip install --no-index --find-links wheelhouse -r requirements.lock.txt
-pip install --no-index --find-links wheelhouse -e .
+在解包根目录创建并激活虚拟环境，再执行：
+
+```powershell
+pip install --no-index --find-links data/wheelhouse -r src/doomsday_seed/resources/requirements.lock.txt
+$env:PYTHONPATH = (Resolve-Path src).Path
 ```
 
-若未提供 wheelhouse，请事先在有网机器执行：
-
-```bash
-pip download -r requirements.lock.txt -d wheelhouse
-```
+若没有 data/wheelhouse，请先在有网且 Python ABI 相同的机器上运行
+`doomsday-seed export --wheelhouse` 备齐依赖后重新导出。解包后的程序直接从 src 加载。
 
 ## 3. 冷启动（先系统层断网）
 
 1. 关闭正在运行的应用与推理子进程。
-2. 清空用户模型缓存（例如 HF_HOME 下的 hub 缓存），避免误用缓存。
+2. 为本次演练指定一个空的 HF_HOME 目录，避免误用旧缓存。
 3. 用防火墙阻断外网或断开网络适配器，**保留回环地址 127.0.0.1**。
 4. 从另一个目录解包并启动：`python -m doomsday_seed serve`。
 5. 打开 `http://127.0.0.1:8777/`，验证完整 UI、试验台流式试用和 `/v1/chat/completions`。
@@ -61,16 +66,17 @@ pip download -r requirements.lock.txt -d wheelhouse
 
 ## 5. 已知限制
 
-- 网页与本地客户端只监听回环地址；其他客户端使用包内 api-key 对应的本地密钥。
+- 网页与本地客户端只监听回环地址；首次启动会生成新的 data/api-key。外部 Agent 密钥需另行配置。
 - 单次只加载一个模型；后台评测在交互时排队。
 - 每项能力的评测口径、硬件门槛与试用方式见各包内 USAGE.md。
 """
 
 
 class RecoveryService:
-    def __init__(self, db: Database, paths: Paths):
+    def __init__(self, db: Database, paths: Paths, library_lock):
         self.db = db
         self.paths = paths
+        self.library_lock = library_lock
 
     # ---------- 断网演练 ----------
     @staticmethod
@@ -120,15 +126,13 @@ class RecoveryService:
     # ---------- 恢复包 ----------
     def build_wheelhouse(self) -> dict[str, Any]:
         """有网时备齐：pip download 锁定依赖到 data/wheelhouse。"""
-        lock = self.paths.root / "requirements.lock.txt"
-        if not lock.exists():
-            return {"ok": False, "reason": "缺少 requirements.lock.txt"}
+        resources = self.paths.package / "resources"
+        lock = resources / "requirements.lock.txt"
         target = self.paths.data / "wheelhouse"
         target.mkdir(parents=True, exist_ok=True)
-        import sys
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "download", "-r", str(lock), "-d", str(target)],
+                [sys.executable, "-m", "pip", "download", "--only-binary=:all:", "-r", str(lock), "-d", str(target)],
                 capture_output=True, text=True, timeout=900)
             return {"ok": result.returncode == 0, "path": str(target),
                     "detail": (result.stdout + result.stderr)[-1000:]}
@@ -136,62 +140,115 @@ class RecoveryService:
             return {"ok": False, "reason": str(exc)}
 
     def export(self, out_path: str | None = None, include_seeds: bool = True) -> dict[str, Any]:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        target = Path(out_path) if out_path else (
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        target = Path(out_path).resolve() if out_path else (
             self.paths.exports / f"doomsday-seed-recovery-{stamp}.zip")
         target.parent.mkdir(parents=True, exist_ok=True)
+        with self.library_lock(wait=True), tempfile.TemporaryDirectory(dir=target.parent) as temp:
+            return self._export(Path(temp), target, include_seeds)
+
+    def _export(self, temp: Path, target: Path, include_seeds: bool) -> dict[str, Any]:
+        from .runtime_registry import RuntimeRegistry
+
         warnings: list[str] = []
         entries: list[tuple[Path, str]] = []
 
-        def add_dir(base: Path, arc_prefix: str, skip: set[str] | None = None):
-            if not base.exists():
-                warnings.append(f"目录缺失，未打包：{base}")
-                return
+        def add_dir(base: Path, arc_prefix: str, *, seed_files=False):
             for path in sorted(base.rglob("*")):
-                if not path.is_file():
+                if not path.is_file() or path == target or path.is_relative_to(temp):
                     continue
                 rel = path.relative_to(base)
-                if any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
+                if seed_files:
+                    if rel.parts[0].startswith((".previous-", ".interrupted-")):
+                        continue
+                elif any((part.startswith(".") and part != ".ready") or part == "__pycache__"
+                         or part.endswith(".lock") for part in rel.parts):
                     continue
-                if skip and any(rel.match(pattern) for pattern in skip):
+                if not path.resolve().is_relative_to(base.resolve()):
+                    warnings.append(f"跳过指向目录外的链接：{path}")
                     continue
                 entries.append((path, f"{arc_prefix}/{rel.as_posix()}"))
 
-        add_dir(self.paths.root / "src" / "doomsday_seed", "src/doomsday_seed")
-        add_dir(self.paths.web, "web")
-        add_dir(self.paths.root / "docs", "docs")
+        add_dir(self.paths.package, "src/doomsday_seed")
         add_dir(self.paths.root / "tests" / "fixtures", "tests/fixtures")
-        add_dir(self.paths.runtimes, "runtimes")
+        add_dir(self.paths.runtimes, "data/runtimes")
         wheelhouse = self.paths.data / "wheelhouse"
         if wheelhouse.exists():
-            add_dir(wheelhouse, "wheelhouse")
+            add_dir(wheelhouse, "data/wheelhouse")
         else:
-            warnings.append("未提供 wheelhouse：请先在有网时执行 pip download，或随包携带可移植运行环境")
-        for name in ("pyproject.toml", "requirements.txt", "requirements.lock.txt"):
-            path = self.paths.root / name
-            if path.exists():
-                entries.append((path, name))
+            warnings.append("未提供 wheelhouse：有网时执行 export --wheelhouse")
         if include_seeds:
-            add_dir(self.paths.seeds, "seeds")
-            if not any(p[1].startswith("seeds/") for p in entries):
+            add_dir(self.paths.seeds, "data/seeds", seed_files=True)
+            if not any(arc.startswith("data/seeds/") for _, arc in entries):
                 warnings.append("尚无已归档种子：恢复包只能验证界面与 API 错误路径")
-        api_key = self.paths.api_key
-        if api_key.exists():
-            entries.append((api_key, "api-key"))
 
-        # 清单与说明（SHA256SUMS 在写完所有文件后生成并追加）。
+        snapshot = temp / self.paths.db.name
+        with closing(sqlite3.connect(self.paths.db)) as source, closing(sqlite3.connect(snapshot)) as backup, backup:
+            source.backup(backup)
+            backup.execute("DELETE FROM settings WHERE key IN ('download_root', 'agent_base_url', 'agent_model')")
+            backup.execute("UPDATE settings SET value='false' WHERE key IN ('auto_update', 'schedule_enabled')")
+            backup.execute("INSERT OR REPLACE INTO settings VALUES ('simulated_offline','true')")
+            backup.execute("DELETE FROM jobs")
+            backup.execute("DELETE FROM meta")
+            backup.execute("DELETE FROM api_keys")
+            if not include_seeds:
+                backup.execute("DELETE FROM seeds")
+                backup.execute("DELETE FROM defaults")
+                backup.execute("UPDATE candidates SET state='candidate' WHERE state IN ('downloaded','offline_ready')")
+        entries.append((snapshot, f"data/{snapshot.name}"))
+
+        registry = RuntimeRegistry(self.paths).load()
+        bundled = {arc for _, arc in entries}
+        for backend, entry in registry["backends"].items():
+            command = []
+            for part in entry.get("command", []):
+                path = Path(part)
+                if part == "@python" or (path.is_absolute() and path.resolve() == Path(sys.executable).resolve()):
+                    part = "@python"
+                elif path.is_absolute():
+                    path = path.resolve()
+                    if path.is_relative_to(self.paths.runtimes.resolve()):
+                        part = "@runtime/" + path.relative_to(self.paths.runtimes.resolve()).as_posix()
+                    elif path.is_relative_to(self.paths.fixtures.resolve()):
+                        part = "@fixture/" + path.relative_to(self.paths.fixtures.resolve()).as_posix()
+                    else:
+                        command = []
+                        break
+                arc = (part.replace("@runtime/", "data/runtimes/", 1) if part.startswith("@runtime/")
+                       else part.replace("@fixture/", "tests/fixtures/", 1))
+                if part.startswith(("@runtime/", "@fixture/")) and arc not in bundled:
+                    command = []
+                    break
+                command.append(part)
+            if entry.get("command") and not command:
+                warnings.append(f"{backend} 运行器未随包迁移，请在目标机器重新登记")
+                entry.clear()
+            if command and command[0] == "@python":
+                entry.get("digests", {}).pop("0", None)
+            entry.update(command=command, verified=False)
+        registry_file = temp / "registry.json"
+        registry_file.write_text(json.dumps(registry, ensure_ascii=False), encoding="utf-8")
+        entries = [(path, arc) for path, arc in entries if arc != "data/runtimes/registry.json"]
+        entries.append((registry_file, "data/runtimes/registry.json"))
+
         sums: list[str] = []
-        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        pending = temp / "recovery.zip"
+        with zipfile.ZipFile(pending, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for path, arc in entries:
-                zf.write(path, arc)
-                sums.append(f"{_sha256(path)}  {arc}")
+                digest = hashlib.sha256()
+                with path.open("rb") as source, zf.open(arc, "w", force_zip64=True) as dest:
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        dest.write(block)
+                        digest.update(block)
+                sums.append(f"{digest.hexdigest()}  {arc}")
             zf.writestr("RESTORE.md", RESTORE_TEXT)
             zf.writestr("SHA256SUMS.txt", "\n".join(sums) + "\n")
+        os.replace(pending, target)
         return {
             "path": str(target), "bytes": target.stat().st_size,
-            "sha256": _sha256(target), "files": len(entries),
+            "sha256": sha256_file(target), "files": len(entries),
             "warnings": warnings,
-            "offline_assets": "web/ 内字体、脚本、样式与背景图均为本地文件；CSP 禁止外部资源",
+            "offline_assets": "网页资产均为本地文件；CSP 禁止外部资源",
         }
 
     @staticmethod
@@ -211,15 +268,11 @@ class RecoveryService:
                 if arc not in names:
                     problems.append(f"缺少必需文件：{arc}")
                     continue
-                actual = hashlib.sha256(zf.read(arc)).hexdigest()
+                with zf.open(arc) as source:
+                    digest_stream = hashlib.sha256()
+                    for block in iter(lambda: source.read(1024 * 1024), b""):
+                        digest_stream.update(block)
+                actual = digest_stream.hexdigest()
                 if actual != digest:
                     problems.append(f"{arc} SHA-256 不符")
         return {"ok": not problems, "problems": problems, "checked": len(lines)}
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()

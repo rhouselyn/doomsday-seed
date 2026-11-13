@@ -11,7 +11,7 @@ from doomsday_seed.models import Candidate, EvaluationRecord, HardwareSample
 
 def _record(**kwargs) -> EvaluationRecord:
     base = dict(
-        id="e1", candidate_id="c1", eval_version="stage1-1.0.0", backend="cpu",
+        id="e1", candidate_id="c1", eval_version="stage1-1.1.0", backend="cpu",
         runner_version="b-test", hardware_fingerprint="fp", quality=0.9,
         passed_cases=7, total_cases=8, median_latency_ms=1000.0,
         score_balanced=0.9, score_speed=1.0, score_accuracy=0.9,
@@ -84,7 +84,7 @@ def test_gates_are_separate_from_promotion():
 def test_eval_config_is_versioned_and_separate_from_debug_samples():
     config = load_eval_config()
     debug = load_debug_samples()
-    assert config["version"] == "stage1-1.0.0"
+    assert config["version"] == "stage1-1.1.0"
     assert config["protocol"]["context"] == 2048
     assert config["protocol"]["concurrency"] == 1
     assert len(config["cases"]) >= 8

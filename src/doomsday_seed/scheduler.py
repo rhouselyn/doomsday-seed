@@ -2,7 +2,7 @@
 
 首次设置时注册任务计划程序，每天本地时间 03:00（可改）；配置错过后可补跑、
 同一计划忽略重复实例。记录上次尝试、上次成功、下一次运行和跳过原因。
-应用层仍用 SyncLock 处理手动触发和计划冲突；非 Windows 明确说明不支持，不假装注册成功。
+应用层仍用 操作系统文件锁 处理手动触发和计划冲突；非 Windows 明确说明不支持，不假装注册成功。
 """
 from __future__ import annotations
 
@@ -44,12 +44,14 @@ def next_run(schedule_time: str, now: datetime | None = None) -> str:
 
 
 def task_xml(schedule_time: str, python_exe: str, project_root: Path,
-             now: datetime | None = None) -> str:
+             now: datetime | None = None, data_dir: Path | None = None) -> str:
     now = now or _local_now()
     clock = parse_schedule_time(schedule_time)
     start = now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
     if start <= now:
         start += timedelta(days=1)
+    arguments = subprocess.list2cmdline(["-m", "doomsday_seed", "sync", "--scheduled",
+                                        "--data", str(data_dir or project_root / "data")])
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -79,7 +81,7 @@ def task_xml(schedule_time: str, python_exe: str, project_root: Path,
   <Actions Context="Author">
     <Exec>
       <Command>{escape(python_exe)}</Command>
-      <Arguments>-m doomsday_seed sync --scheduled</Arguments>
+      <Arguments>{escape(arguments)}</Arguments>
       <WorkingDirectory>{escape(str(project_root))}</WorkingDirectory>
     </Exec>
   </Actions>
@@ -111,7 +113,8 @@ class ScheduleService:
                                                    "请用系统自带的定时机制调用 CLI 同步命令"}
         xml_path = self.paths.data / "daily-sync-task.xml"
         xml_path.parent.mkdir(parents=True, exist_ok=True)
-        xml_path.write_text(task_xml(schedule_time, self.python_exe, self.paths.root),
+        xml_path.write_text(task_xml(schedule_time, self.python_exe, self.paths.root,
+                                    data_dir=self.paths.data),
                             encoding="utf-16")
         ok, detail = self._schtasks(["/Create", "/TN", TASK_NAME, "/XML", str(xml_path), "/F"])
         self.db.set_meta("schedule_registered", "1" if ok else "0")
@@ -181,7 +184,7 @@ class ScheduleService:
         return {"registered": ok, "task_name": TASK_NAME, "detail": detail}
 
     def maybe_catch_up(self, pipeline) -> dict[str, Any]:
-        """配置错过后可补跑；同一计划忽略重复实例由 SyncLock 保证。"""
+        """配置错过后可补跑；同一计划忽略重复实例由 操作系统文件锁 保证。"""
         state = self.status()
         if not state["catch_up_due"]:
             return {"triggered": False, "reason": "无需补跑或自动更新未启用"}

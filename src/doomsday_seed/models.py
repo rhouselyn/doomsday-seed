@@ -52,7 +52,7 @@ class FileSpec(BaseModel):
 
     repo_path: str
     local_path: str
-    size_bytes: int = 0
+    size_bytes: int = Field(default=0, ge=0)
     kind: Literal["weight", "projection", "config", "license", "model_card", "usage", "sample"] = "weight"
     upstream_sha256: str | None = None
     sha256: str | None = None
@@ -186,7 +186,7 @@ class EvaluationRecord(BaseModel):
     id: str
     candidate_id: str
     task: str = "chat"
-    eval_version: str = "stage1-1.0.0"
+    eval_version: str = "stage1-1.1.0"
     backend: str = "cpu"
     runner_version: str = "unregistered"
     hardware_fingerprint: str = ""
@@ -236,7 +236,7 @@ class Settings(BaseModel):
 
     auto_update: bool = True
     schedule_enabled: bool = True
-    schedule_time: str = "03:00"
+    schedule_time: str = Field(default="03:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     agent_enabled: bool = True
     # 可选：兼容 OpenAI Chat Completions 的模型服务；留空使用内置默认。
     agent_base_url: str = ""

@@ -57,8 +57,9 @@
 要求：Python ≥ 3.11，Windows 11 x64（首发平台）。
 
 ```bash
-# 安装（可选项目自身安装，或直接 pip install -r requirements.lock.txt）
-pip install -e .
+# 安装锁定依赖，再注册项目的 CLI 入口
+pip install -r requirements.lock.txt
+pip install --no-deps -e .
 
 # 启动本地服务与网页
 doomsday-seed serve
@@ -80,10 +81,10 @@ doomsday-seed hardware
 
 ```bash
 # 注册 / 核对 Windows 任务计划
-doomsday-seed schedule
+doomsday-seed schedule install
 doomsday-seed schedule --verify
 
-# 手动触发一轮（计划任务模式：触发后不阻塞）
+# 手动触发一轮（计划任务模式：等待本轮作业结束）
 doomsday-seed sync --scheduled
 ```
 
@@ -156,7 +157,7 @@ src/doomsday_seed/     # 内核
 ├── recovery.py        # 恢复：导出与对账
 ├── api.py / app.py    # 本机 API 与服务
 └── cli.py             # 命令行入口
-web/                   # 纯静态前端（离线自足）
+src/doomsday_seed/web/  # 纯静态前端（离线自足）
 data/                  # 种子库与数据库（不入库，永不外传）
 tests/                 # 流水线、恢复、API 与核心测试
 docs/                  # 开发文档与研究记录
@@ -166,6 +167,7 @@ docs/                  # 开发文档与研究记录
 
 ```bash
 pytest
+node --test tests/test_web.cjs
 ```
 
 ---
@@ -174,3 +176,8 @@ pytest
 > 但雪原之下，只要还有一粒验证过的种子，春天就还欠你一个答案。
 >
 > —— 《末日种子》
+
+恢复包以 `RESTORE.md` 为准。导出保留归档、候选和默认选择，恢复后默认暂停同步并生成新的本地 API 密钥。
+旧评测结果仍可查看。用 `doomsday-seed retest <seed_id>` 按当前版本更新已归档模型的验证状态。
+动作识别的锁定环境支持 Windows x64 / Python 3.13。
+如使用本地 Agent 对话 API，查询消息只读取信息，执行命令为 `/download <候选 ID>` 和 `/archive <任务> <完整绝对路径>`。

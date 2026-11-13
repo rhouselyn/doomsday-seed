@@ -31,7 +31,7 @@ def test_local_pages_and_status(client):
 
 def test_catalog_separates_public_estimate_and_local_measurement(client):
     data = client.get("/api/catalog").json()
-    assert data["eval_version"] == "stage1-1.0.0"
+    assert data["eval_version"] == "stage1-1.1.0"
     ready = [c for c in data["candidates"] if c["state"] == "offline_ready"]
     assert len(ready) == 1
     item = ready[0]

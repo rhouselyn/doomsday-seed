@@ -19,8 +19,8 @@ def enqueue(service, raw_path: str, task: str) -> Job:
     if source.is_symlink() or (hasattr(source, "is_junction") and source.is_junction()):
         raise ValueError("请直接提供模型文件或目录，而不是链接")
     source = source.resolve()
-    root = service.paths.data.resolve()
-    if source == root or source in root.parents or root in source.parents:
+    roots = (service.paths.data.resolve(), service.paths.seeds.resolve(), service.paths.staging.resolve())
+    if any(source == root or source in root.parents or root in source.parents for root in roots):
         raise ValueError("请选择种子库数据目录之外的模型文件")
     job_id = uuid.uuid4().hex[:16]
     job = Job(id=job_id, kind="local_import", idempotency_key="local-import|" + job_id,

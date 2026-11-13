@@ -8,14 +8,13 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
 from .adapters import registered_adapters
 from .agent import AgentGateway
 from .catalog import load_debug_samples, grade_case
-from .config import FIXED_CONTEXT, FIXED_CONCURRENCY, Paths
+from .config import FIXED_CONTEXT, FIXED_CONCURRENCY, Paths, DebugPermissionError, safe_path
 from .db import Database
 from .downloader import DownloadPlan, Downloader
 from .models import RuntimeConfig
@@ -25,20 +24,6 @@ from .runtime_registry import RuntimeRegistry
 ALLOWED_TEMPLATES = {None, "", "chatml", "qwen", "llama3", "gemma", "default", "auto"}
 GPU_LAYERS_RANGE = (0, 100)
 CONTEXT_RANGE = (512, 8192)
-
-
-class DebugPermissionError(Exception):
-    pass
-
-
-def safe_path(base: Path, relative: str) -> Path:
-    """只允许当前作业暂存区内的相对路径。"""
-    if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
-        raise DebugPermissionError(f"非法相对路径：{relative}")
-    resolved = (base / relative).resolve()
-    if not resolved.is_relative_to(base.resolve()):
-        raise DebugPermissionError(f"路径越出暂存区：{relative}")
-    return resolved
 
 
 class DebugToolbox:
@@ -77,6 +62,8 @@ class DebugToolbox:
 
     # ---------- 参数与启动程序校验 ----------
     def validate_config(self, config: dict[str, Any]) -> RuntimeConfig:
+        if config.get("extra_args"):
+            raise DebugPermissionError("不允许额外启动参数，只能修改已登记的调参字段")
         if config.get("adapter") not in {a["id"] for a in registered_adapters()}:
             raise DebugPermissionError("适配器未登记：作业应标「待适配」")
         if config.get("backend") not in ("cpu", "cuda"):
@@ -125,11 +112,14 @@ class DebugToolbox:
         }
 
     def _start(self, job_id: str, plan: DownloadPlan, config: RuntimeConfig,
-               backend: str | None = None) -> RunningServer:
-        files_dir = self.downloader.files_dir(job_id)
+               files_dir: Path) -> RunningServer:
+        if config.mmproj:
+            if config.mmproj not in {f.local_path for f in plan.files if f.kind == "projection"}:
+                raise DebugPermissionError("投影文件必须来自已校验的文件清单")
+            safe_path(files_dir, config.mmproj)
         self.inference.register_staging(f"staging-{job_id}", files_dir,
                                         self._staging_manifest(plan, config))
-        return self.inference.start_staging_server(f"staging-{job_id}", config, backend)
+        return self.inference.start_staging_server(f"staging-{job_id}", config)
 
     def sample_request(self, server: RunningServer, case: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -144,7 +134,11 @@ class DebugToolbox:
                     "detail": f"{type(exc).__name__}: {exc}"}
 
     def run_debug(self, job_id: str, plan: DownloadPlan, base_config: RuntimeConfig,
-                  gateway: AgentGateway) -> tuple[RuntimeConfig, dict[str, Any]]:
+                  gateway: AgentGateway, files_dir: Path) -> tuple[RuntimeConfig, dict[str, Any]]:
+        with self.inference.reserve(f"staging-{job_id}"):
+            return self._run_debug(job_id, plan, base_config, gateway, files_dir)
+
+    def _run_debug(self, job_id, plan, base_config, gateway, files_dir):
         """启动暂存服务 → 调试样例 → 诊断 → Agent 在允许范围内调参 → 再验。"""
         diagnostics: dict[str, Any] = {
             "job_id": job_id, "adapter": base_config.adapter,
@@ -157,7 +151,7 @@ class DebugToolbox:
             config = self.validate_config(config.model_dump())
             for attempt in range(2):
                 try:
-                    server = self._start(job_id, plan, config)
+                    server = self._start(job_id, plan, config, files_dir)
                     diagnostics["attempts"].append({
                         "attempt": attempt + 1, "backend": server.backend,
                         "cold_start_ms": server.cold_start_ms,
@@ -199,7 +193,7 @@ class DebugToolbox:
                     self.inference.stop_server(server)
                     server = None
                     config = self.validate_config(merged)
-                    server = self._start(job_id, plan, config)
+                    server = self._start(job_id, plan, config, files_dir)
                     diagnostics["retry_samples"] = [
                         self.sample_request(server, case) for case in load_debug_samples()]
                     failed = [s for s in diagnostics["retry_samples"] if not s["ok"]]

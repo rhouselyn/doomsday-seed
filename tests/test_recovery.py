@@ -8,7 +8,7 @@ from pathlib import Path
 from doomsday_seed.recovery import RecoveryService
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "web"
+WEB = ROOT / "src" / "doomsday_seed" / "web"
 
 
 def test_export_package_contains_everything_and_verifies(installed):
@@ -19,10 +19,10 @@ def test_export_package_contains_everything_and_verifies(installed):
     with zipfile.ZipFile(package) as zf:
         names = set(zf.namelist())
         assert "RESTORE.md" in names and "SHA256SUMS.txt" in names
-        assert "web/index.html" in names and "web/assets/vault.webp" in names
-        assert "web/assets/styles.css" in names and "web/assets/app.js" in names
-        assert any(n.startswith("seeds/") and n.endswith("manifest.json") for n in names)
-        assert any(n.startswith("seeds/") and n.endswith("USAGE.md") for n in names)
+        assert "src/doomsday_seed/web/index.html" in names and "src/doomsday_seed/web/assets/vault.webp" in names
+        assert "src/doomsday_seed/web/assets/styles.css" in names and "src/doomsday_seed/web/assets/app.js" in names
+        assert any(n.startswith("data/seeds/") and n.endswith("manifest.json") for n in names)
+        assert any(n.startswith("data/seeds/") and n.endswith("USAGE.md") for n in names)
         assert any(n.startswith("src/doomsday_seed/") for n in names)
         restore = zf.read("RESTORE.md").decode("utf-8")
         assert "pip install --no-index --find-links" in restore

@@ -7,7 +7,6 @@ API 通过、断网可用和评分过线分别记录；换设备、换参数或�
 """
 from __future__ import annotations
 
-import os
 import statistics
 import subprocess
 import threading
@@ -17,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import compute_scores, grade_case, load_eval_config
-from .config import EVAL_VERSION, LOOPBACK_HOST, MIB, Paths
+from .config import LOOPBACK_HOST, MIB, Paths
 from .db import Database
 from .downloader import DownloadPlan
 from .models import Candidate, EvaluationRecord, HardwareSample, RuntimeConfig
@@ -126,7 +125,7 @@ class Evaluator:
               max_tokens: int | None = None) -> tuple[dict[str, Any], float]:
         started = time.perf_counter()
         result = self.inference.chat(model=model, messages=messages,
-                                     max_tokens=max_tokens, interactive=False)
+                                     temperature=0.0, max_tokens=max_tokens, interactive=False)
         elapsed = (time.perf_counter() - started) * 1000
         return result, elapsed
 
@@ -134,7 +133,7 @@ class Evaluator:
         started = time.perf_counter()
         try:
             for chunk in self.inference.chat_stream(model=model, messages=messages,
-                                                    max_tokens=32, interactive=False):
+                                                    temperature=0.0, max_tokens=32, interactive=False):
                 if chunk.startswith("data:") and "[DONE]" not in chunk:
                     return (time.perf_counter() - started) * 1000
         except RuntimeUnavailable:
@@ -155,11 +154,12 @@ class Evaluator:
         record = EvaluationRecord(
             id=uuid.uuid4().hex[:20], candidate_id=candidate.id, task=candidate.task,
             eval_version=eval_config["version"], backend=config.backend,
-            runner_version=config.runner_version or self.registry.version(),
+            runner_version=self.registry.version(config.backend),
             hardware_fingerprint=sample.fingerprint(),
             params={"context": config.context, "concurrency": config.concurrency,
                     "gpu_layers": config.gpu_layers, "backend": config.backend,
-                    "chat_template": config.chat_template,
+                    "chat_template": config.chat_template, "temperature": 0.0,
+                    "projection": bool(config.mmproj),
                     "config_fingerprint": config.fingerprint()},
             total_cases=len(cases),
         )
@@ -169,14 +169,18 @@ class Evaluator:
         speeds: list[float] = []
         cold_start_ms = 0.0
         try:
-            with ResourceMonitor() as monitor:
+            with self.inference.reserve(model, keep_warm=True), ResourceMonitor() as monitor:
                 # 冷启动单独计时：第一次请求触发加载，不计入预热后的中位耗时。
                 warmup_case = cases[0]
                 try:
-                    _, warmup_ms = self._call(model, warmup_case["messages"],
+                    warmup, warmup_ms = self._call(model, warmup_case["messages"],
                                               warmup_case.get("max_tokens"))
                     cold_start_ms = self.inference.last_cold_start_ms or warmup_ms
                     record.cold_start_ms = round(cold_start_ms, 1)
+                    record.backend = warmup["doomsday"]["backend"]
+                    record.runner_version = self.registry.version(record.backend)
+                    record.params.update(backend=record.backend,
+                                         gpu_layers=config.gpu_layers if record.backend == "cuda" else 0)
                 except RuntimeUnavailable as exc:
                     api_ok = False
                     record.detail["error"] = str(exc)
@@ -190,6 +194,8 @@ class Evaluator:
                         try:
                             result, elapsed = self._call(model, case["messages"],
                                                          case.get("max_tokens"))
+                            if result["doomsday"]["backend"] != record.backend:
+                                raise RuntimeUnavailable("评测期间运行后端发生变化")
                             outputs.append(result["choices"][0]["message"]["content"])
                             latencies.append(elapsed)
                             tokens = result.get("usage", {}).get("completion_tokens", 0)
@@ -202,11 +208,12 @@ class Evaluator:
                             record.detail.setdefault("errors", []).append(str(exc))
                     api_ok = api_ok and case_api_ok
                     output = outputs[0] if outputs else ""
-                    passed, detail = grade_case(case, output)
+                    grades = [grade_case(case, response) for response in outputs]
+                    passed, detail = grades[0]
                     finite = [l for l in latencies if l != float("inf")]
                     median = statistics.median(finite) if finite else float(eval_config["max_wait_ms"])
                     median_latencies.append(median)
-                    stable = len({o.strip() for o in outputs}) <= 1
+                    stable = case_api_ok and len({passed for passed, _ in grades}) == 1
                     case_results.append({
                         "id": case["id"], "category": case.get("category", ""),
                         "passed": bool(passed and case_api_ok), "output": output[:500],

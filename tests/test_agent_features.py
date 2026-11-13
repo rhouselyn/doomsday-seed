@@ -5,7 +5,7 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from doomsday_seed.agent_interaction import _mutations_allowed, _run_tool
+from doomsday_seed.agent_interaction import _command, _run_tool
 from doomsday_seed.app import create_app
 from doomsday_seed.credentials import CredentialStore
 from doomsday_seed.local_import import enqueue
@@ -26,14 +26,10 @@ def test_key_is_encrypted_and_never_returned(service_factory):
 
 def test_agent_actions_require_explicit_matching_request(service_factory):
     svc = service_factory().service
-    assert not _mutations_allowed("查找视觉模型，先不要下载")
-    assert _mutations_allowed("请归档 C:\\models\\a.gguf")
-    with pytest.raises(ValueError):
-        _run_tool(svc, "archive_local", {"path": "C:\\other.gguf", "task": "chat"},
-                  "请归档 C:\\models\\a.gguf")
-    with pytest.raises(ValueError):
-        _run_tool(svc, "archive_local", {"path": "C:\\models\\a.gguf", "task": "chat"},
-                  "查看 C:\\models\\a.gguf，不要归档")
+    assert _command(svc, "请解释 org/repo 的下载方法，先只讲步骤。") is None
+    assert _command(svc, "请归档 C:/models/a.gguf") is None
+    with pytest.raises(ValueError, match="不支持"):
+        _run_tool(svc, "archive_local", {"path": "C:/models", "task": "chat"})
     assert not svc.db.list_jobs()
 
 

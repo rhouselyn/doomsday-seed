@@ -27,7 +27,6 @@ const taskCopy = {
 const taskInfo = id => state.catalog?.tasks.find(t => t.id === id);
 const taskField = (task, field) => task?.[field] || taskCopy[task?.id]?.[field] || '';
 const ready = c => Boolean(c.seed?.offline_ready && c.seed.integrity === 'ok');
-const waiting = job => job?.state.startsWith('waiting_');
 const working = job => job && !['done', 'failed'].includes(job.state);
 const activeJob = c => (c.jobs || []).find(job => job.state !== 'done') || null;
 const size = n => n > 0 ? (n >= 1024**3 ? (n / 1024**3).toFixed(1) + ' GiB' : (n / 1024**2).toFixed(1) + ' MiB') : '';
@@ -176,13 +175,15 @@ function modelLinks(c) {
 
 function modelActions(c, bucket) {
   if (bucket === 'stored') {
-    return ready(c)
-      ? `<button class="button primary" type="button" data-try="${esc(c.seed.id)}">试用</button>`
-      : '<span class="muted small-copy">已保存，等待本机验证</span>';
+    if (ready(c)) return `<button class="button primary" type="button" data-try="${esc(c.seed.id)}">试用</button>`;
+    const job = activeJob(c);
+    if (job && working(job) && !job.state.startsWith('waiting_')) return '<span class="muted small-copy">验证中</span>';
+    if (!c.install_block) return `<button class="button primary" type="button" data-download="${esc(c.id)}" data-dmode="local">验证本机试用</button>`;
+    return '<span class="muted small-copy">已收藏，暂不支持本机试用</span>';
   }
   if (bucket === 'pending') {
     const job = c.jobs?.[0];
-    if (job?.state === 'failed') return `<button class="button outline" type="button" data-download="${esc(c.id)}" data-dmode="local">重试</button>`;
+    if (job?.state === 'failed' || job?.state.startsWith('waiting_')) return `<button class="button outline" type="button" data-download="${esc(c.id)}" data-dmode="${esc(job.mode || 'local')}">重试</button>`;
     return '<span class="muted small-copy">准备中</span>';
   }
   const actions = [];
@@ -242,16 +243,10 @@ function renderLibrary() {
     { id: 'stored', label: '已落库', items: [] },
   ];
   const byId = Object.fromEntries(buckets.map(b => [b.id, b]));
-  // 同一仓库 + 变体可能同时存在受控占位与固定修订记录；只保留信息更完整的一条。
-  const unique = new Map();
-  const score = c => Number(Boolean(c.seed)) * 8 + Number(Boolean(c.jobs?.length)) * 4
-    + Number(c.commit_rev && c.commit_rev !== 'main') * 2 + Number(c.size_bytes > 0);
-  (state.catalog.candidates || []).forEach(c => {
-    const key = `${c.repo}|${c.variant}|${c.task}`;
-    const prev = unique.get(key);
-    if (!prev || score(c) > score(prev)) unique.set(key, c);
-  });
-  unique.forEach(c => {
+  const candidates = state.catalog.candidates || [];
+  const key = c => `${c.repo}|${c.variant}|${c.task}`;
+  const fixed = new Set(candidates.filter(c => c.commit_rev !== 'main').map(key));
+  candidates.filter(c => c.commit_rev !== 'main' || !fixed.has(key(c))).forEach(c => {
     if (c.seed) byId.stored.items.push(c);
     else if (activeJob(c)) byId.pending.items.push(c);
     else byId.explore.items.push(c);
@@ -388,6 +383,7 @@ async function savePreferences() {
       });
     }
     state.prefDirty = false;
+    state.settings = await api('/api/settings');
     renderSettings();
     renderLibrary();
     say('preferenceStatus', `已保存 ${rows.length} 个类型`);
@@ -411,6 +407,8 @@ async function saveService(event) {
     if (key) {
       state.agentConfig = await api('/api/agent/config', 'PUT', { api_key: key });
       $('#agentKey').value = '';
+    }
+    if (state.agentConfig?.configured) {
       say('serviceStatus', '密钥已保存，正在测试连接…');
       await api('/api/agent/test', 'POST', {});
       say('serviceStatus', '连接成功');
@@ -495,10 +493,11 @@ function renderLab() {
   const usable = state.catalog.tasks.filter(t => t.enabled || t.id === task.id);
   const groups = taskGroups().filter(g => usable.some(t => t.group === g));
   const pendingCount = state.catalog.tasks.length - usable.length;
+  const busy = Boolean(state.chat || state.mediaRunning);
   render('labTasks', groups.map(group => `<div class="lab-group"><p>${esc(group)}</p><div class="lab-chips">${usable.filter(t => t.group === group).map(t => {
     const n = available.filter(m => m.task === t.id).length;
     const meta = n ? `<small aria-label="${n} 个可试用">${n}</small>` : '<small class="none">无可用</small>';
-    return `<button type="button" class="lab-chip" data-lab-task="${esc(t.id)}" aria-pressed="${t.id === task.id}">${esc(t.label)}${meta}</button>`;
+    return `<button type="button" class="lab-chip" data-lab-task="${esc(t.id)}" ${busy ? 'disabled' : ''} aria-pressed="${t.id === task.id}">${esc(t.label)}${meta}</button>`;
   }).join('')}</div></div>`).join('') +
     (pendingCount ? `<p class="lab-note">另有 ${pendingCount} 个类型仍在接入，可在<a href="#/library" data-view="library">模型库</a>查看来源与收藏。</p>` : ''));
   say('labTaskTitle', task.label);
@@ -506,7 +505,6 @@ function renderLab() {
   $('#labModelWrap').hidden = !task.enabled;
   render('labModel', items.map(m => `<option value="${esc(m.seed_id)}">${esc(m.variant.replace(/\.gguf$|\.task$/i, ''))}</option>`).join('') || '<option value="">暂无离线版本</option>');
   $('#labModel').value = state.model;
-  const busy = Boolean(state.chat || state.mediaRunning);
   $('#labModel').disabled = busy || !state.model;
   const chat = task.id === 'chat', media = task.id === 'pose' || task.id === 'hand';
   const has = task.enabled && Boolean(state.model);
@@ -691,8 +689,11 @@ async function runMedia(event) {
 function refresh() {
   if (state.refresh) return state.refresh;
   const firstCatalog = !state.catalog;
-  state.refresh = Promise.all([api('/api/catalog'), api('/api/status'), api('/api/jobs')]).then(([catalog, status, jobs]) => {
-    state.catalog = catalog;
+  state.refresh = api('/api/status').then(async status => {
+    if (firstCatalog || state.catalogRevision !== status.catalog_revision) {
+      state.catalog = await api('/api/catalog');
+      state.catalogRevision = status.catalog_revision;
+    }
     state.status = status;
     say('connectionText', status.network.simulated_offline ? '更新已暂停' : status.network.source_error ? '部分来源不可达' : '本机已连接');
     $('.connection').dataset.state = status.network.source_error ? 'error' : status.network.simulated_offline ? 'paused' : 'ok';
@@ -713,6 +714,7 @@ document.addEventListener('click', event => {
     event.preventDefault();
     go(el.dataset.view);
   } else if (el.dataset.labTask) {
+    if (state.chat || state.mediaRunning) return;
     if (el.dataset.labTask !== state.labTask) {
       state.labTask = el.dataset.labTask;
       state.model = '';

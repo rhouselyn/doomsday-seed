@@ -4,12 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 from typing import Any
 
 from .app import Service
 from .config import APP_VERSION, DEFAULT_PORT, LOOPBACK_HOST
 from .models import Settings
+from .runner import RuntimeUnavailable
 
 
 def _out(data: Any) -> None:
@@ -42,22 +42,22 @@ def cmd_serve(args, svc: Service) -> int:
 
 def cmd_sync(args, svc: Service) -> int:
     service = svc.pipeline.sync(trigger="scheduled" if args.scheduled else "manual",
-                                wait=args.wait)
+                                wait=True)
     _out(service.model_dump())
+    if any(svc.db.get_job(job_id).state != "done" for job_id in service.jobs):
+        return 1
     return 0 if service.status in ("ok", "partial", "skipped") else 1
 
 
 def cmd_download(args, svc: Service) -> int:
     job = svc.pipeline.submit_download(args.candidate_id, args.task, args.profile,
-                                       autostart=not args.wait)
+                                       autostart=False)
     print(f"作业 {job.id} 已创建（幂等键 {job.idempotency_key}）")
-    if args.wait:
-        if svc.db.get_job(job.id).state == "queued":
-            svc.pipeline.run_job(job.id)
-        _out(svc.db.get_job(job.id).model_dump())
-    else:
-        print("用 jobs 命令或网页轮询进度。")
-    return 0
+    if svc.db.get_job(job.id).state == "queued":
+        svc.pipeline.run_job(job.id)
+    current = svc.db.get_job(job.id)
+    _out(current.model_dump())
+    return 0 if current.state == "done" else 1
 
 
 def cmd_list(args, svc: Service) -> int:
@@ -65,7 +65,11 @@ def cmd_list(args, svc: Service) -> int:
     rows = [{"id": c.id, "task": c.task, "repo": c.repo, "variant": c.variant,
              "state": c.state, "license": c.license, "size_bytes": c.size_bytes,
              "reason": c.reason} for c in items]
-    _out(rows if not args.json_ndjson else [json.dumps(r, ensure_ascii=False) for r in rows])
+    if args.json_ndjson:
+        for row in rows:
+            _out(json.dumps(row, ensure_ascii=False))
+    else:
+        _out(rows)
     return 0
 
 
@@ -87,6 +91,7 @@ def cmd_jobs(args, svc: Service) -> int:
 def cmd_settings(args, svc: Service) -> int:
     settings = svc.db.get_settings()
     if args.set:
+        previous = settings
         data = settings.model_dump()
         for pair in args.set:
             if "=" not in pair:
@@ -98,59 +103,40 @@ def cmd_settings(args, svc: Service) -> int:
                 continue
             data[key] = _parse_value(raw)
         settings = Settings(**data)
-        svc.db.put_settings(settings)
+        from fastapi import HTTPException
+        from .api import save_settings
+        try:
+            settings = save_settings(svc, settings)
+        except (HTTPException, OSError, ValueError) as exc:
+            print(getattr(exc, "detail", str(exc)), file=sys.stderr)
+            return 1
+        svc.gateway.enabled = settings.agent_enabled
+        svc.reload_agent_client()
+        if (settings.schedule_time, settings.schedule_enabled) != (previous.schedule_time, previous.schedule_enabled):
+            svc.scheduler.apply_settings(settings)
     _out({**settings.model_dump(), "effective": svc.scheduler.status()})
     return 0
 
 
 def cmd_default(args, svc: Service) -> int:
-    db = svc.db
-    pointer = db.get_default(args.task, args.profile)
-    old = pointer.seed_id
-    if args.auto:
-        from .catalog import load_eval_config, promote, rank
-        config = load_eval_config()
-        pairs = []
-        for record in db.list_evaluations(eval_version=config["version"]):
-            seed = db.find_seed_by_candidate(record.candidate_id)
-            if seed and seed.offline_ready:
-                pairs.append((record, seed))
-        if not pairs:
-            print("没有通过门槛的本机成绩，默认指针保持不变。")
-            return 1
-        best = rank([r for r, _ in pairs], args.profile)[0]
-        ok, reason = promote(None, best, args.profile, config)
-        print(reason)
-        if not ok:
-            return 1
-        pointer.seed_id = next(s for r, s in pairs if r.id == best.id).id
-        pointer.pinned = False
-        pointer.source = "auto"
-        pointer.previous_seed_id = old
-    else:
-        seed = db.get_seed(args.seed_id or "")
-        if not seed or not seed.offline_ready:
-            print("只能固定或切换到「离线可用」的已验证版本。")
-            return 1
-        pointer.seed_id = seed.id
-        pointer.pinned = not args.unpin
-        pointer.previous_seed_id = old
-        pointer.source = "user"
-    db.set_default(pointer)
-    _out(pointer.model_dump())
+    from fastapi import HTTPException
+    from .api import DefaultPayload, put_default
+    try:
+        result = put_default(args.task, args.profile,
+                             DefaultPayload(seed_id=args.seed_id, auto=args.auto,
+                                            pinned=not args.unpin), svc)
+    except HTTPException as exc:
+        _out(exc.detail)
+        return 1
+    _out(result["default"])
     return 0
 
 
 def cmd_verify(args, svc: Service) -> int:
-    from .archive import compute_completeness, reconcile, verify_seed
-    report = reconcile(svc.db, svc.paths)
-    checks = []
-    for seed in svc.db.list_seeds():
-        directory = svc.paths.seeds / seed.rel_dir
-        ok, missing, mismatched = verify_seed(directory, seed.manifest)
-        ratio, _ = compute_completeness(directory, seed.manifest)
-        checks.append({"seed_id": seed.id, "ok": ok, "completeness": ratio,
-                       "missing": missing, "mismatched": mismatched})
+    from .archive import reconcile
+    with svc.pipeline.library_lock(wait=True), svc.inference.reserve("verify"):
+        report = reconcile(svc.db, svc.paths)
+    checks = report.pop("checks")
     _out({"reconcile": report, "seeds": checks,
           "all_ok": all(c["ok"] for c in checks)})
     return 0 if all(c["ok"] for c in checks) else 1
@@ -193,36 +179,19 @@ def cmd_runtime(args, svc: Service) -> int:
         _out(svc.registry.register(args.backend, args.command, args.version, args.build))
     else:
         data = svc.registry.load()
-        _out({"registry": data, "probe": svc.registry.probe()[0],
-              "detail": svc.registry.probe()[1]})
+        available, detail = svc.registry.probe()
+        _out({"registry": data, "probe": available, "detail": detail})
     return 0
 
 
 def cmd_retest(args, svc: Service) -> int:
-    """对已归档种子按当前评测版本重测（换口径后需重测候选与现任）。"""
-    from .downloader import DownloadPlan
-    from .models import FileSpec, RuntimeConfig
-    seed = svc.db.get_seed(args.seed_id)
-    if not seed:
-        print(f"种子不存在：{args.seed_id}")
+    try:
+        result = svc.pipeline.retest(args.seed_id)
+    except (ValueError, OSError, RuntimeUnavailable) as exc:
+        _out({"ok": False, "error": str(exc)})
         return 1
-    candidate = svc.db.get_candidate(seed.candidate_id)
-    directory = svc.paths.seeds / seed.rel_dir
-    files = [FileSpec(repo_path=i["source_path"], local_path=i["relative_path"],
-                      size_bytes=i["size_bytes"], kind=i["kind"],
-                      sha256=i.get("sha256")) for i in seed.manifest.get("sizes_and_hashes", [])]
-    plan = DownloadPlan(candidate_id=candidate.id, repo=candidate.repo,
-                        commit_rev=seed.manifest["source"]["fixed_revision"], files=files,
-                        runtime_config=RuntimeConfig(**seed.manifest["runtime_config"]))
-    verification = {"files": [{"local_path": i["relative_path"], "kind": i["kind"],
-                               "size_bytes": i["size_bytes"], "sha256": i.get("sha256"),
-                               "repo_path": i["source_path"]}
-                              for i in seed.manifest.get("sizes_and_hashes", [])],
-                    "total_bytes": seed.manifest.get("total_bytes", 0)}
-    record = svc.evaluator.evaluate(candidate=candidate, staging_dir=directory, plan=plan,
-                                    config=plan.runtime_config, verification=verification)
-    _out(record.model_dump())
-    return 0
+    _out(result)
+    return 0 if result["ok"] else 1
 
 
 def cmd_doctor(args, svc: Service) -> int:
@@ -255,7 +224,6 @@ def cmd_doctor(args, svc: Service) -> int:
         "backends": backends, "backend_detail": detail,
         "eval_version": load_eval_config()["version"],
         "seeds": len(seeds), "candidates": len(svc.db.list_candidates()),
-        "startup_reconcile": svc.startup(),
         "schedule": svc.scheduler.status(),
         "problems": problems,
         "ok": not problems,
@@ -271,14 +239,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("serve", parents=[common], help="启动本地服务与网页")
-    p.add_argument("--host", default=LOOPBACK_HOST)
+    p.add_argument("--host", default=LOOPBACK_HOST, choices=["127.0.0.1", "localhost", "::1"])
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
     p.add_argument("--log-level", default="warning")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("sync", parents=[common], help="发现、预选并下载入围候选")
     p.add_argument("--scheduled", action="store_true", help="标记为计划任务触发")
-    p.add_argument("--wait", action="store_true", help="等待作业完成（计划任务不要用）")
+    p.add_argument("--wait", action="store_true", help="兼容旧命令；CLI 始终等待作业完成")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("download", parents=[common], help="下载指定候选")

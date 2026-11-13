@@ -7,14 +7,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 APP_NAME = "末日种子"
 APP_TAGLINE = "为断网之后，保存仍能运行的 AI。"
 APP_VERSION = "0.3.0"
 
 # §4 评测配置是版本化的；改口径后旧成绩必须重测，不能沿用。
-EVAL_VERSION = "stage1-1.0.0"
+EVAL_VERSION = "stage1-1.1.0"
 # §3 首轮固定场景：2048 token 上下文、并发 1。
 FIXED_CONTEXT = 2048
 FIXED_CONCURRENCY = 1
@@ -48,13 +48,28 @@ MAX_NEW_VARIANTS_PER_TASK_PROFILE_PER_RUN = 1
 HF_MAX_RETRIES = 4
 HF_MAX_WORKERS = 5
 HF_BACKOFF_BASE_SECONDS = 1.5
-HF_CURSOR_OVERLAP = 20
 # §6 上传限制（首版聊天可附带一个文本文件）。
 MAX_UPLOAD_BYTES = 2 * MIB
 ALLOWED_TEXT_SUFFIXES = (".txt", ".md", ".json", ".csv", ".log")
 
 DEFAULT_SCHEDULE_TIME = "03:00"
 DEFAULT_TRUSTED_PUBLISHERS = ("Qwen", "ggml-org", "unsloth", "bartowski", "lmstudio-community")
+
+
+class DebugPermissionError(ValueError):
+    pass
+
+
+def safe_path(base: Path, relative: str) -> Path:
+    """Resolve a portable package path without escaping its directory."""
+    if (not isinstance(relative, str) or not relative or "\\" in relative or ":" in relative
+            or any(part in ("", ".", "..") or PureWindowsPath(part).is_reserved()
+                   or part.endswith((".", " ")) for part in relative.split("/"))):
+        raise DebugPermissionError(f"非法相对路径：{relative}")
+    resolved = (base / relative).resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        raise DebugPermissionError(f"路径越出包目录：{relative}")
+    return resolved
 
 
 @dataclass
@@ -70,18 +85,22 @@ class Paths:
 
     @classmethod
     def detect(cls, data_dir: str | os.PathLike | None = None) -> "Paths":
-        root = Path(__file__).resolve().parents[2]
-        raw = data_dir or os.environ.get("DOOMSDAY_DATA") or (root / "data")
+        package = Path(__file__).resolve().parent
+        root = package.parents[1]
+        default_data = (root / "data" if package == root / "src" / "doomsday_seed"
+                        else Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share")
+                        / "doomsday-seed")
+        raw = data_dir or os.environ.get("DOOMSDAY_DATA") or default_data
         return cls(root=root, data=Path(raw).resolve())
 
     # 程序与静态资源
     @property
     def package(self) -> Path:
-        return self.root / "src" / "doomsday_seed"
+        return Path(__file__).resolve().parent
 
     @property
     def web(self) -> Path:
-        return self.root / "web"
+        return self.package / "web"
 
     @property
     def web_assets(self) -> Path:
@@ -159,5 +178,5 @@ class Paths:
         return self.data / "sync.lock"
 
     def ensure(self) -> None:
-        for p in (self.data, self.staging, self.seeds, self.runtimes, self.exports, self.eval_resources):
+        for p in (self.data, self.staging, self.seeds, self.runtimes, self.exports):
             p.mkdir(parents=True, exist_ok=True)

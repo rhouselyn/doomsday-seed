@@ -10,11 +10,12 @@ import hashlib
 import os
 import shutil
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any, Callable
 
-from .config import HF_BACKOFF_BASE_SECONDS, HF_MAX_RETRIES, Paths
+from .config import HF_BACKOFF_BASE_SECONDS, HF_MAX_RETRIES, Paths, safe_path
 from .models import DownloadPlan, FileSpec, RuntimeConfig
 
 
@@ -59,7 +60,7 @@ def hub_fetch(repo: str, filename: str, revision: str, dest: Path) -> Path:
         raise DownloadError("huggingface_hub 未安装，无法下载", "network") from exc
     return Path(hf_hub_download(
         repo_id=repo, filename=filename, revision=revision,
-        local_dir=str(dest), local_dir_use_symlinks=False,
+        local_dir=str(dest),
     ))
 
 
@@ -110,15 +111,20 @@ class Downloader:
         return self.staging_dir(job_id) / "files"
 
     # ---------- 预检（dry run） ----------
-    def preflight(self, plan: DownloadPlan, job_id: str) -> PreflightReport:
+    def preflight(self, plan: DownloadPlan, job_id: str, *, reuse: bool = False) -> PreflightReport:
         report = PreflightReport()
+        seen = set()
         for spec in plan.files:
             for name in (spec.repo_path, spec.local_path):
-                if (not name or "\\" in name or ":" in name or PurePosixPath(name).is_absolute()
-                        or any(part in ("", ".", "..") or PureWindowsPath(part).is_reserved()
-                               or part.endswith((".", " ")) for part in name.split("/"))):
+                try:
+                    safe_path(self.files_dir(job_id), name)
+                except ValueError:
                     report.ok = False
                     report.reasons.append("文件清单含不安全的路径")
+            if spec.local_path.casefold() in seen or spec.local_path.casefold() in {"manifest.json", "usage.md"}:
+                report.ok = False
+                report.reasons.append("文件清单含重复路径或覆盖归档元数据")
+            seen.add(spec.local_path.casefold())
             item = {
                 "repo_path": spec.repo_path, "local_path": spec.local_path,
                 "size_bytes": spec.size_bytes, "kind": spec.kind,
@@ -131,7 +137,7 @@ class Downloader:
             usage = shutil.disk_usage(self.paths.staging)
             report.free_bytes = usage.free
             # 落盘前检查能否写完当前包（预留 5% 给临时文件与元数据）。
-            if report.total_bytes and usage.free < report.total_bytes * 1.05:
+            if not reuse and report.total_bytes and usage.free < report.total_bytes * 1.05:
                 report.ok = False
                 report.reasons.append(
                     f"可用空间 {usage.free} 字节不足以下载并写完当前包 {report.total_bytes} 字节")
@@ -167,9 +173,11 @@ class Downloader:
         raw.mkdir(parents=True, exist_ok=True)
         total = len(plan.files)
         for index, spec in enumerate(plan.files):
-            dest = target / spec.local_path
+            dest = safe_path(target, spec.local_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists() and spec.size_bytes and dest.stat().st_size == spec.size_bytes:
+            expected = spec.upstream_sha256 or spec.sha256
+            if (dest.is_file() and spec.size_bytes and dest.stat().st_size == spec.size_bytes
+                    and (not expected or sha256_file(dest).lower() == expected.lower())):
                 if progress:
                     progress((index + 1) / max(1, total), f"续跑：已存在 {spec.local_path}")
                 continue
@@ -184,7 +192,10 @@ class Downloader:
                     src = fetch(plan.repo, spec.repo_path, plan.commit_rev, raw)
                     if not Path(src).exists():
                         raise DownloadError(f"下载结果缺失：{src}", "network")
-                    shutil.copyfile(Path(src), dest)
+                    if Path(src).resolve().is_relative_to(raw.resolve()):
+                        os.replace(src, dest)
+                    else:
+                        shutil.copyfile(src, dest)
                     last = None
                     break
                 except DownloadError:
@@ -202,7 +213,7 @@ class Downloader:
     def verify(self, files_dir: Path, plan: DownloadPlan) -> dict[str, Any]:
         result: dict[str, Any] = {"ok": True, "files": [], "errors": [], "total_bytes": 0}
         for spec in plan.files:
-            path = files_dir / spec.local_path
+            path = safe_path(files_dir, spec.local_path)
             entry: dict[str, Any] = {"repo_path": spec.repo_path, "local_path": spec.local_path,
                                      "kind": spec.kind, "present": path.exists(),
                                      "size_bytes": 0, "sha256": None,
@@ -220,7 +231,8 @@ class Downloader:
                 result["ok"] = False
                 result["errors"].append(
                     f"{spec.local_path} 大小不符：声明 {spec.size_bytes}，实际 {size}")
-            if spec.upstream_sha256 and digest.lower() != spec.upstream_sha256.lower():
+            expected = spec.upstream_sha256 or spec.sha256
+            if expected and digest.lower() != expected.lower():
                 result["ok"] = False
                 result["errors"].append(f"{spec.local_path} 上游 SHA-256 校验失败")
             result["files"].append(entry)
@@ -229,18 +241,30 @@ class Downloader:
         return result
 
     # ---------- 归档重命名 ----------
-    def promote(self, job_id: str, seed_id: str) -> Path:
+    @contextmanager
+    def promote(self, job_id: str, seed_id: str):
         src = self.files_dir(job_id)
-        dst = self.paths.seeds / seed_id
-        if not src.exists():
+        dst = safe_path(self.paths.seeds, seed_id)
+        if not src.is_dir():
             raise DownloadError("暂存目录不存在，无法归档", "other")
-        dst.parent.mkdir(parents=True, exist_ok=True)
+        previous = dst.with_name(f".previous-{dst.name}")
+        if previous.exists():
+            raise DownloadError("发现未完成的归档替换，请先运行 verify", "other")
         if dst.exists():
-            shutil.rmtree(dst)
-        os.replace(src, dst)  # 同一卷，校验通过后重命名
-        return dst
+            os.replace(dst, previous)
+        try:
+            os.replace(src, dst)
+            yield dst
+        except BaseException:
+            if dst.exists() and not src.exists():
+                os.replace(dst, src)
+            if previous.exists() and not dst.exists():
+                os.replace(previous, dst)
+            raise
+        else:
+            if previous.exists():
+                shutil.rmtree(previous, ignore_errors=True)
 
-    @staticmethod
     def weight_file(plan: DownloadPlan) -> str | None:
         for spec in plan.files:
             if spec.kind == "weight":

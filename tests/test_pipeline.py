@@ -45,7 +45,7 @@ def test_sota_collection_ignores_local_runtime_and_keeps_seed_unverified(service
     item.task = "video_gen"
     item.evidence = [Evidence(
         title="Fixture", url="https://example.test/result", model_version=item.commit_rev,
-        variant=item.variant, benchmark_key="fixture/test/v1", metric="accuracy", value=0.9,
+        variant=item.variant, benchmark_key="explicit-v2:fixture/test/v1", metric="accuracy", value=0.9,
     )]
     svc.db.upsert_candidate(item)
     monkeypatch.setattr(svc, "hardware", lambda: pytest.fail("SOTA collection probed local hardware"))

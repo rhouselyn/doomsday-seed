@@ -20,10 +20,11 @@ from .downloader import Downloader
 from .evaluation import Evaluator
 from .hardware import probe as probe_hardware
 from .jobs import JobPipeline
+from .locks import LockBusy
 from .models import HardwareSample
 from .preselect import PreSelector, controlled_candidates
 from .recovery import RecoveryService
-from .runner import InferenceService
+from .runner import InferenceService, RuntimeUnavailable
 from .runtime_registry import RuntimeRegistry
 from .scheduler import ScheduleService, parse_schedule_time
 from .security import LocalSecurity
@@ -63,14 +64,14 @@ class Service:
         self.evaluator = Evaluator(self.db, self.paths, self.inference, self.registry,
                                    sample_provider=self.hardware)
         self.preselector = PreSelector(self.db, self.paths, self.gateway,
-                                       commit_resolver=commit_resolver)
+                                       commit_resolver=commit_resolver, source=self.source)
         self.pipeline = JobPipeline(
             db=self.db, paths=self.paths, registry=self.registry, source=self.source,
             preselector=self.preselector, downloader=self.downloader,
             debug_box=self.debug_box, evaluator=self.evaluator,
             inference=self.inference, gateway=self.gateway)
         self.scheduler = ScheduleService(self.db, self.paths)
-        self.recovery = RecoveryService(self.db, self.paths)
+        self.recovery = RecoveryService(self.db, self.paths, self.pipeline.library_lock)
         self.startup_report: dict[str, Any] = {}
         self._stop_daily = Event()
         self._daily: Thread | None = None
@@ -95,7 +96,11 @@ class Service:
 
     def startup(self) -> dict[str, Any]:
         # §5 启动时对账：接回有效包，残缺包继续排队。
-        self.startup_report = reconcile(self.db, self.paths)
+        try:
+            with self.pipeline.library_lock(), self.inference.reserve("reconcile"):
+                self.startup_report = reconcile(self.db, self.paths)
+        except (LockBusy, RuntimeUnavailable):
+            self.startup_report = {"skipped": "种子库正在使用"}
         self.gateway.enabled = self.db.get_settings().agent_enabled
         self.pipeline.run_pending()
         try:
@@ -107,7 +112,8 @@ class Service:
     def shutdown(self) -> None:
         self._stop_daily.set()
         if self._daily and self._daily.is_alive():
-            self._daily.join(timeout=2)
+            self._daily.join()
+        self.pipeline.shutdown()
         self.inference.stop_all()
         self.db.close()
 

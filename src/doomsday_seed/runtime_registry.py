@@ -18,7 +18,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
-from .config import Paths
+from .config import Paths, safe_path
+from .locks import file_lock
 
 CPU_BUILD = "b12207"
 CPU_DIGEST = "24447c546dca02bc449c7369eba07608cf5b170a59042ef388712654356d0d4c"
@@ -57,8 +58,11 @@ class RuntimeRegistry:
                 for backend in ("cpu", "cuda"):
                     data.setdefault("backends", {}).setdefault(
                         backend, {"command": [], "verified": False, "note": ""})
+                entries = [e for e in data["backends"].values() if e.get("command")]
+                data["locked"] = bool(entries and all(
+                    e.get("locked", data.get("locked")) and e.get("digests") for e in entries))
                 return data
-            except (OSError, ValueError):
+            except (OSError, ValueError, AttributeError):
                 pass
         return _default_registry(self.paths)
 
@@ -77,9 +81,12 @@ class RuntimeRegistry:
         import httpx
         from .downloader import sha256_file
 
-        with _prepare_lock:
-            if self.command("cpu") or self.command("cuda"):
+        with _prepare_lock, file_lock(self.paths.runtimes / "cpu-install.lock", wait=True):
+            if self.command("cpu"):
                 return
+            existing = self.load()["backends"]["cpu"]
+            if existing.get("digests") and existing.get("command"):
+                raise RuntimeError("CPU 运行器文件与登记不符，请检查文件后重新登记")
             if sys.platform != "win32" or platform.machine().lower() not in ("amd64", "x86_64"):
                 raise RuntimeError("当前系统的对话运行环境暂未接入")
             target = self.paths.runtimes / f"llama-{CPU_BUILD}-cpu"
@@ -118,37 +125,78 @@ class RuntimeRegistry:
                             raise
             self.register("cpu", [str(binary)], CPU_BUILD)
 
-    def command(self, backend: str) -> list[str]:
-        entry = self.load()["backends"].get(backend, {})
-        cmd = entry.get("command") or []
-        return [str(part) for part in cmd]
+    def _resolve(self, command: list[str]) -> list[str]:
+        resolved = []
+        for part in command:
+            if part == "@python":
+                part = sys.executable
+            elif part.startswith("@runtime/"):
+                part = str(safe_path(self.paths.runtimes, part.removeprefix("@runtime/")))
+            elif part.startswith("@fixture/"):
+                part = str(safe_path(self.paths.fixtures, part.removeprefix("@fixture/")))
+            resolved.append(part)
+        if resolved and (executable := shutil.which(resolved[0])):
+            resolved[0] = str(Path(executable).resolve())
+        return resolved
 
-    def version(self) -> str:
-        return str(self.load().get("version", "unregistered"))
+    @staticmethod
+    def _digests(command: list[str]) -> dict[str, str]:
+        from .downloader import sha256_file
+
+        return {str(i): sha256_file(Path(part)) for i, part in enumerate(command) if Path(part).is_file()}
+
+    def _checked_command(self, entry: dict) -> list[str]:
+        cmd = self._resolve(entry.get("command") or [])
+        expected = entry.get("digests")
+        if cmd and expected:
+            actual = self._digests(cmd)
+            if any(actual.get(index) != digest for index, digest in expected.items()):
+                raise ValueError("运行器文件哈希与登记不符，请重新登记")
+        return cmd
+
+    def command(self, backend: str) -> list[str]:
+        try:
+            return self._checked_command(self.load()["backends"].get(backend, {}))
+        except (OSError, ValueError):
+            return []
+
+    def version(self, backend: str | None = None) -> str:
+        data = self.load()
+        if backend:
+            return data["backends"][backend].get("version", data.get("version", "unregistered"))
+        return data.get("version", "unregistered")
 
     def is_verified(self, backend: str) -> bool:
-        return bool(self.load()["backends"].get(backend, {}).get("verified"))
+        entry = self.load()["backends"].get(backend, {})
+        return bool(entry.get("verified") and entry.get("digests") and self.command(backend))
 
     def mark_verified(self, backend: str, note: str = "") -> None:
-        """§2：有「验证过的」CUDA 后端时才优先用独显；CPU 是基础回退。"""
-        data = self.load()
-        entry = data["backends"][backend]
-        entry["verified"] = True
-        entry["note"] = note
-        self.save(data)
+        with file_lock(self.paths.runtimes / "registry.lock", wait=True):
+            data = self.load()
+            entry = data["backends"][backend]
+            if entry.get("command") and self._checked_command(entry):
+                entry["digests"] = self._digests(self._resolve(entry["command"]))
+                entry["verified"] = bool(entry["digests"])
+                entry["note"] = note
+                self.save(data)
 
     def register(self, backend: str, command: list[str], version: str,
                  build: str = "", locked: bool = True) -> dict[str, Any]:
-        data = self.load()
-        data["version"] = version
-        data["build"] = build or data.get("build", "")
-        data["locked"] = locked
-        entry = data["backends"][backend]
-        if entry.get("command") != list(command):
-            entry["verified"] = False  # 换了构建必须重新验证
-        entry["command"] = list(command)
-        entry["note"] = "已登记，等待本机冷启动验证"
-        return self.save(data)
+        resolved = self._resolve(command)
+        if not resolved or not Path(resolved[0]).is_file():
+            raise ValueError("运行器可执行文件不存在")
+        with file_lock(self.paths.runtimes / "registry.lock", wait=True):
+            data = self.load()
+            data["version"] = version
+            data["build"] = build or data.get("build", "")
+            data["locked"] = locked
+            entry = data["backends"][backend]
+            digests = self._digests(resolved)
+            if (entry.get("command"), entry.get("digests"), entry.get("version")) != (resolved, digests, version):
+                entry["verified"] = False
+            entry.update(command=resolved, digests=digests, version=version, locked=locked,
+                         note="已登记，等待本机冷启动验证")
+            return self.save(data)
 
     def probe(self) -> tuple[dict[str, bool], dict[str, str]]:
         """检查后端能否真正初始化，返回 (可用性, 原因)。"""
@@ -157,13 +205,18 @@ class RuntimeRegistry:
         detail: dict[str, str] = {}
         for backend in ("cpu", "cuda"):
             entry = data["backends"][backend]
-            cmd = entry.get("command") or []
+            try:
+                cmd = self._checked_command(entry)
+            except (OSError, ValueError) as exc:
+                available[backend] = False
+                detail[backend] = str(exc)
+                continue
             if not cmd:
                 available[backend] = False
                 detail[backend] = "运行器未登记：请先安装锁定的 llama-server 构建"
                 continue
             exe = Path(cmd[0])
-            if not exe.exists() and not _on_path(cmd[0]):
+            if not exe.is_file():
                 available[backend] = False
                 detail[backend] = f"运行器文件不存在：{exe}"
                 continue
@@ -181,11 +234,6 @@ class RuntimeRegistry:
                 available[backend] = False
                 detail[backend] = f"运行器自检异常：{exc}"
         return available, detail
-
-
-def _on_path(name: str) -> bool:
-    import shutil
-    return shutil.which(name) is not None
 
 
 def _offline_env() -> dict[str, str]:

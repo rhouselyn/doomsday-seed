@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Iterator, Protocol
+from typing import Any, Protocol
 
 
 class Adapter(Protocol):

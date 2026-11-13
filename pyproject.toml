@@ -28,7 +28,7 @@ doomsday-seed = "doomsday_seed.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-doomsday_seed = ["resources/eval/*.json", "resources/*.txt"]
+doomsday_seed = ["resources/eval/*.json", "resources/*.txt", "web/index.html", "web/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import os
 import platform
-import re
 import shutil
 import subprocess
 from dataclasses import dataclass, asdict
 from functools import lru_cache
 
-from .config import GIB, MIB, Paths, ram_reserve, vram_reserve
+from .config import MIB, Paths, ram_reserve, vram_reserve
 from .models import HardwareSample
 from .runtime_registry import RuntimeRegistry
 

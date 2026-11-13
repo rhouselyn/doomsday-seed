@@ -32,11 +32,11 @@ class FakeHfApi:
     def __init__(self):
         self.calls = {"list_models": 0, "model_info": 0}
 
-    def list_models(self, author=None, sort=None, direction=None, limit=None, full=None):
+    def list_models(self, **kwargs):
         self.calls["list_models"] += 1
         return [SimpleNamespace(id=REPO, lastModified="2026-11-10T01:00:00+00:00")]
 
-    def model_info(self, repo_id, files_metadata=False, revision=None):
+    def model_info(self, repo_id, files_metadata=False, revision=None, token=None):
         self.calls["model_info"] += 1
         siblings = []
         for name, data in CONTENTS.items():

@@ -8,24 +8,26 @@ Hugging Face 优先用 HfApi.list_models / model_info，按订阅任务、可信
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from .config import (DEFAULT_TRUSTED_PUBLISHERS, HF_BACKOFF_BASE_SECONDS, HF_CURSOR_OVERLAP,
+from .config import (DEFAULT_TRUSTED_PUBLISHERS, HF_BACKOFF_BASE_SECONDS,
                      HF_MAX_RETRIES, HF_MAX_WORKERS)
 from .hardware import estimate_footprint
-from .models import Candidate, Estimate, Evidence, FileSpec, Settings, utc_now
+from .models import Candidate, Estimate, Evidence, FileSpec, Settings
 
 LICENSE_ALLOWLIST = {
     "apache-2.0", "mit", "bsd-3-clause", "bsd-2-clause", "cc-by-4.0",
-    "cc-by-sa-4.0", "cc0-1.0", "qwen", "qwen-research", "llama3", "gemma", "other",
+    "cc-by-sa-4.0", "cc0-1.0", "qwen", "qwen-research", "llama3", "gemma",
 }
 MODEL_CARD_NAMES = ("README.md", "readme.md", "modelcard.md")
 LICENSE_NAMES = ("LICENSE", "LICENSE.txt", "LICENSE.md", "license")
 USAGE_NAMES = ("USAGE.md", "usage.md", "docs/usage.md", "examples/README.md")
+GGUF_SHARD = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf", re.I)
 CONFIG_NAMES = ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json")
 
 
@@ -80,9 +82,13 @@ class HuggingFaceSource:
         raise RuntimeError(f"达到重试上限（{HF_MAX_RETRIES} 次）：{last}")
 
     # ---------- 扫描 ----------
-    def discover(self, settings: Settings, max_models: int = 40) -> DiscoveryResult:
+    def discover(self, settings: Settings) -> DiscoveryResult:
         result = DiscoveryResult()
+        scan_started = datetime.now(timezone.utc)
         cursor = self.db.get_source(self.name).get("cursor")
+        scope = json.dumps(sorted(settings.trusted_publishers or DEFAULT_TRUSTED_PUBLISHERS))
+        if self.db.get_meta("hf-paginated-scope") != scope:
+            cursor = None
         overlap_cutoff: datetime | None = None
         if cursor:
             try:
@@ -99,15 +105,34 @@ class HuggingFaceSource:
             result.status = "retained"
             return result
 
+        def modified_at(item):
+            modified = getattr(item, "last_modified", None) or getattr(item, "lastModified", None)
+            if isinstance(modified, str):
+                try:
+                    modified = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+            if modified is not None and modified.tzinfo is None:
+                modified = modified.replace(tzinfo=timezone.utc)
+            return modified
+
         def list_publisher(publisher: str) -> tuple[list[Any], str]:
+            def scan():
+                items = []
+                for item in api.list_models(author=publisher, sort="last_modified",
+                                            expand=["lastModified"], token=False):
+                    modified = modified_at(item)
+                    if overlap_cutoff and modified and modified < overlap_cutoff:
+                        break
+                    items.append(item)
+                return items
+
             try:
-                return list(self._call(lambda: api.list_models(
-                    author=publisher, sort="lastModified", direction=-1,
-                    limit=min(20, max_models + HF_CURSOR_OVERLAP), full=False))), ""
+                return self._call(scan), ""
             except Exception as exc:
                 return [], f"{type(exc).__name__}: {str(exc)[:500]}"
 
-        # 发布者之间最多 5 路并发；任何发布者完全失败时沿用旧行为：保留旧目录。
+        # 发布者失败保留旧游标，仍处理本轮其他可达来源。
         with ThreadPoolExecutor(max_workers=HF_MAX_WORKERS) as pool:
             batches = list(pool.map(list_publisher, publishers))
         failures = [error for _, error in batches if error]
@@ -115,8 +140,7 @@ class HuggingFaceSource:
             message = "; ".join(failures[:3])
             self.db.mark_source_error(self.name, message)
             result.errors.extend({"source": self.name, "error": error} for error in failures)
-            result.status = "retained"
-            return result
+            result.status = "partial"
 
         repos: list[Any] = [repo for batch, _ in batches for repo in batch]
         for repo in settings.manual_repos:  # 手动仓库地址补入
@@ -131,23 +155,12 @@ class HuggingFaceSource:
             if not repo_id or repo_id in seen:
                 continue
             seen.add(repo_id)
-            modified = getattr(item, "lastModified", None)
-            if overlap_cutoff and modified:
-                try:
-                    modified_dt = (datetime.fromisoformat(modified.replace("Z", "+00:00"))
-                                   if isinstance(modified, str) else modified)
-                    if modified_dt.tzinfo is None:
-                        modified_dt = modified_dt.replace(tzinfo=timezone.utc)
-                    if modified_dt < overlap_cutoff:
-                        continue
-                except (ValueError, TypeError):
-                    pass
             ordered.append(repo_id)
         result.scanned = len(ordered)
 
         def load_repo(repo_id: str) -> tuple[str, list[Candidate], str]:
             try:
-                info = self._call(lambda: api.model_info(repo_id, files_metadata=True))
+                info = self._call(lambda: api.model_info(repo_id, files_metadata=True, token=False))
                 return repo_id, self._to_candidates(info), ""
             except Exception as exc:
                 return repo_id, [], str(exc)[:500]
@@ -162,11 +175,33 @@ class HuggingFaceSource:
                 continue
             result.candidates.extend(candidates)
 
-        new_cursor = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        result.cursors[self.name] = new_cursor
-        self.db.mark_source_success(self.name, new_cursor,
-                                    error="; ".join(e["error"] for e in result.errors[:3]))
+        if result.errors:
+            result.status = "partial" if result.candidates else "retained"
+            self.db.mark_source_error(self.name, "; ".join(e["error"] for e in result.errors[:3]))
+        else:
+            new_cursor = scan_started.isoformat(timespec="seconds")
+            result.cursors[self.name] = new_cursor
         return result
+
+    def pin(self, candidate: Candidate, revision: str | None = None) -> Candidate:
+        if candidate.source != "huggingface":
+            return candidate
+        ref = revision or candidate.commit_rev
+        weights = [f.repo_path for f in candidate.files if f.kind == "weight"]
+        split = GGUF_SHARD.fullmatch(weights[0]) if weights else None
+        complete = not split or weights == [
+            f"{split[1]}-{number:05d}-of-{split[3]}.gguf" for number in range(1, int(split[3]) + 1)]
+        if re.fullmatch(r"[0-9a-f]{40}", ref) and candidate.commit_rev == ref and weights and complete and all(
+                f.size_bytes > 0 or f.kind not in ("weight", "projection") for f in candidate.files):
+            return candidate
+        info = self._call(lambda: self.api().model_info(candidate.repo, revision=ref, files_metadata=True, token=False))
+        variants = self._to_candidates(info, all_variants=True)
+        fixed = next((c for c in variants if c.variant == candidate.variant and c.repo == candidate.repo), None)
+        if fixed is None or any(f.size_bytes <= 0 for f in fixed.files if f.kind in ("weight", "projection")):
+            raise ValueError("无法确认固定版本或完整权重大小")
+        if re.fullmatch(r"[0-9a-f]{40}", ref) and fixed.commit_rev != ref:
+            raise ValueError("上游返回的提交与请求不符")
+        return self.db.upsert_candidate(fixed)
 
     # ---------- 转换 ----------
     @staticmethod
@@ -184,11 +219,13 @@ class HuggingFaceSource:
             })
         return out
 
-    def _to_candidates(self, info: Any) -> list[Candidate]:
+    def _to_candidates(self, info: Any, *, all_variants=False) -> list[Candidate]:
         repo = getattr(info, "id", "") or ""
-        commit = getattr(info, "sha", "") or "main"  # 固定 commit
+        commit = getattr(info, "sha", "") or ""
+        if not repo or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            return []
         card = getattr(info, "cardData", None) or {}
-        if isinstance(card, str):
+        if not hasattr(card, "get"):
             card = {}
         license_id = str(card.get("license", "") or "").lower()
         publisher = repo.split("/")[0] if "/" in repo else ""
@@ -197,13 +234,26 @@ class HuggingFaceSource:
         gated = str(getattr(info, "gated", "") or "")
         siblings = self._siblings(info)
         by_name = {s["name"]: s for s in siblings}
-        weights = [s for s in siblings if s["name"].lower().endswith(".gguf")
-                   and not s["name"].lower().endswith(".mmproj.gguf")]
-        # 优先试装常见量化；每仓库最多两个变体，避免无界扩张。
-        weights.sort(key=lambda s: (0 if "Q4_K_M" in s["name"] else
-                                   1 if "Q4_0" in s["name"] else 2, s["size"]))
-        weights = weights[:2]
-        package = [s for s in siblings if s["name"].lower().endswith((".safetensors", ".onnx", ".onnx_data"))]
+        groups = {}
+        for sibling in siblings:
+            name = sibling["name"]
+            if not name.lower().endswith(".gguf") or "mmproj" in name.lower():
+                continue
+            split = GGUF_SHARD.fullmatch(name)
+            key = (split[1], int(split[3])) if split else (name, 1)
+            groups.setdefault(key, []).append((int(split[2]) if split else 1, sibling))
+        weights = []
+        for (_, count), parts in groups.items():
+            parts.sort(key=lambda part: part[0])
+            if len(parts) == count and all(number == i for i, (number, _) in enumerate(parts, 1)):
+                weights.append([item for _, item in parts])
+        weights.sort(key=lambda group: (0 if "Q4_K_M" in group[0]["name"] else
+                                        1 if "Q4_0" in group[0]["name"] else 2,
+                                        sum(s["size"] for s in group)))
+        if not all_variants:
+            weights = weights[:2]
+        package = [s for s in siblings if s["name"].lower().endswith(
+            (".safetensors", ".onnx", ".onnx_data", ".bin"))]
 
         evidence = [Evidence(
             title="上游模型卡与文件清单",
@@ -213,28 +263,33 @@ class HuggingFaceSource:
             note="原始精度成绩只作同家族线索；具体量化版标「待测」",
         )]
         for block in (card.get("model-index") or [])[:2]:
+            if not isinstance(block, dict):
+                continue
             for res in (block.get("results") or [])[:2]:
+                if not isinstance(res, dict):
+                    continue
                 evidence.append(Evidence(
-                    title=str(res.get("task", {}).get("type", "公开评测")),
+                    title=str((res.get("task") or {}).get("type", "公开评测")),
                     source="模型卡 model-index", model_version=commit,
-                    dataset=str(res.get("dataset", {}).get("name", "")),
+                    dataset=str((res.get("dataset") or {}).get("name", "")),
                     protocol=str(res.get("metrics", "")),
                     note="公开证据，不等于本机实测",
                 ))
 
         out: list[Candidate] = []
-        for weight in weights:
-            variant = weight["name"].split("/")[-1]
-            files: list[FileSpec] = [FileSpec(
-                repo_path=weight["name"], local_path=variant, size_bytes=weight["size"],
-                kind="weight", upstream_sha256=weight["sha256"])]
+        for group in weights:
+            variant = group[0]["name"].rsplit("/", 1)[-1]
+            weight_bytes = sum(part["size"] for part in group)
+            files = [FileSpec(repo_path=part["name"], local_path=part["name"].rsplit("/", 1)[-1],
+                              size_bytes=part["size"], kind="weight", upstream_sha256=part["sha256"])
+                     for part in group]
             attachments = 0
             for group, kind in ((MODEL_CARD_NAMES, "model_card"), (LICENSE_NAMES, "license"),
                                 (USAGE_NAMES, "usage"), (CONFIG_NAMES, "config")):
                 for name in group:
                     if name in by_name and name not in {f.repo_path for f in files}:
                         f = by_name[name]
-                        files.append(FileSpec(repo_path=name, local_path=name.replace("/", "_"),
+                        files.append(FileSpec(repo_path=name, local_path="upstream/" + name,
                                               size_bytes=f["size"], kind=kind,
                                               upstream_sha256=f["sha256"]))
                         attachments += f["size"]
@@ -246,10 +301,11 @@ class HuggingFaceSource:
                                           size_bytes=s["size"], kind="projection",
                                           upstream_sha256=s["sha256"]))
                     attachments += s["size"]
-            total = weight["size"] + attachments
+            total = weight_bytes + attachments
             projection = sum(f.size_bytes for f in files if f.kind == "projection")
-            footprint = estimate_footprint(weight["size"], projection_bytes=projection,
-                                           backend="cuda" if weight["size"] > 1_500_000_000 else "cpu")
+            backend = "cuda" if weight_bytes > 1_500_000_000 else "cpu"
+            footprint = estimate_footprint(weight_bytes, projection_bytes=projection,
+                                           backend=backend, gpu_layers=99 if backend == "cuda" else 0)
             state, reason = "candidate", ""
             if gated and gated.lower() != "false":
                 state, reason = "gated", "受限访问模型：需用户在线办理授权"
@@ -272,13 +328,13 @@ class HuggingFaceSource:
                 state=state, reason=reason,
             ))
         if package:
-            files = [FileSpec(repo_path=s["name"], local_path=s["name"], size_bytes=s["size"],
+            files = [FileSpec(repo_path=s["name"], local_path="payload/" + s["name"], size_bytes=s["size"],
                               kind="weight", upstream_sha256=s["sha256"]) for s in package]
             for s in siblings:
                 name = s["name"]
                 if name.lower().endswith((".json", ".md", ".txt", ".model", ".vocab", ".tiktoken")) or name in LICENSE_NAMES:
                     files.append(FileSpec(
-                        repo_path=name, local_path=name, size_bytes=s["size"], upstream_sha256=s["sha256"],
+                        repo_path=name, local_path="payload/" + name, size_bytes=s["size"], upstream_sha256=s["sha256"],
                         kind="license" if name in LICENSE_NAMES else "model_card" if name in MODEL_CARD_NAMES else "config",
                     ))
             variant = repo.rsplit("/", 1)[-1] + " · 原始文件"
@@ -300,27 +356,27 @@ def _exact_scores(card: dict, repo: str, revision: str, variant: str) -> list[Ev
         if not isinstance(block, dict) or block.get("name") not in (repo, repo.rsplit("/", 1)[-1]):
             continue
         for result in block.get("results") or []:
-            dataset = result.get("dataset") or {}
-            # shortcut: 自动排名只接受声明数据集版本与切分的结构化模型卡成绩。
-            if not all(dataset.get(k) for k in ("type", "revision", "split")):
+            if not isinstance(result, dict) or result.get("variant") != variant or result.get("revision") != revision:
                 continue
+            dataset = result.get("dataset") or {}
             source = result.get("source") or {}
+            if not all(dataset.get(k) for k in ("type", "revision", "split")) or not source.get("url") or not result.get("protocol"):
+                continue
             for metric in result.get("metrics") or []:
                 kind = str(metric.get("type", "")).lower()
-                if kind not in {"accuracy", "acc", "f1", "map", "iou", "wer", "cer", "bleu"}:
-                    continue
                 value = metric.get("value")
-                if not isinstance(value, (float, int)) or isinstance(value, bool):
+                unit = metric.get("unit")
+                if (kind not in {"accuracy", "acc", "f1", "map", "iou", "wer", "cer", "bleu"}
+                        or not isinstance(value, (float, int)) or isinstance(value, bool) or not unit):
                     continue
                 key = json.dumps([dataset.get(k) for k in ("type", "revision", "config", "split", "args")] +
-                                 [result.get("task"), source.get("name"), metric.get("args"),
-                                  metric.get("unit") or ("0–100" if value > 1 else "0–1")],
+                                 [result.get("task"), source["url"], result["protocol"], metric.get("args"), unit],
                                  sort_keys=True, ensure_ascii=False, default=str)
                 scores.append(Evidence(
                     title=str(dataset.get("name") or dataset["type"]), source=source.get("name") or "上游自报",
                     url=f"https://huggingface.co/{repo}/blob/{revision}/README.md", model_version=revision,
-                    dataset=str(dataset["type"]), protocol=f"{dataset['revision']} · {dataset['split']}",
-                    benchmark_key=key, variant=variant, metric=kind, value=value,
+                    dataset=str(dataset["type"]), protocol=result["protocol"],
+                    benchmark_key="explicit-v2:" + key, variant=variant, metric=kind, value=value,
                     higher_is_better=kind not in {"wer", "cer"},
                 ))
     return scores
@@ -347,6 +403,3 @@ def local_adapter(candidate: Candidate) -> str | None:
     if candidate.source == "mediapipe" and candidate.task in {"pose", "hand"}:
         return "mediapipe"
     return None
-
-
-CONTROLLED_SOURCE_NAME = "controlled"

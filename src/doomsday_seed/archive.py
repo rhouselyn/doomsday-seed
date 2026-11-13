@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
-from .config import Paths
+from .config import Paths, safe_path
 from .db import Database
 from .downloader import sha256_file
 from .models import Candidate, DownloadPlan, EvaluationRecord, HardwareSample, Job, RuntimeConfig, utc_now
@@ -184,27 +185,38 @@ curl http://127.0.0.1:8777/v1/chat/completions \\
 
 def write_manifest(seed_dir: Path, manifest: dict[str, Any]) -> Path:
     path = seed_dir / "manifest.json"
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending = path.with_suffix(".json.tmp")
+    pending.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending.replace(path)
     return path
 
 
 def write_usage(seed_dir: Path, markdown: str) -> Path:
     path = seed_dir / "USAGE.md"
-    path.write_text(markdown, encoding="utf-8")
+    pending = path.with_suffix(".md.tmp")
+    pending.write_text(markdown, encoding="utf-8")
+    pending.replace(path)
     return path
 
 
 def compute_completeness(seed_dir: Path, manifest: dict[str, Any]) -> tuple[float, list[str]]:
     """按实际文件与字节数计算完整度，返回 (0–1, 缺失说明)。"""
-    declared = manifest.get("sizes_and_hashes", [])
-    if not declared:
+    declared = manifest.get("sizes_and_hashes", []) if isinstance(manifest, dict) else []
+    if not isinstance(declared, list) or not declared:
         return 0.0, ["清单中没有文件"]
-    expected_bytes = sum(int(f.get("size_bytes") or 0) for f in declared)
+    try:
+        expected_bytes = sum(int(f.get("size_bytes") or 0) for f in declared)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0, ["清单中的文件记录无效"]
     present_bytes = 0
     missing: list[str] = []
     for item in declared:
-        path = seed_dir / item["relative_path"]
-        if not path.exists():
+        try:
+            path = safe_path(seed_dir, item.get("relative_path", ""))
+        except ValueError as exc:
+            missing.append(str(exc))
+            continue
+        if not path.is_file():
             missing.append(f"缺少必需文件：{item['relative_path']}")
             continue
         size = path.stat().st_size
@@ -219,39 +231,72 @@ def verify_seed(seed_dir: Path, manifest: dict[str, Any]) -> tuple[bool, list[st
     """返回 (是否完好, 缺件错误, 哈希不符)；缺件错误可定位到具体文件。"""
     missing: list[str] = []
     mismatched: list[str] = []
-    for item in manifest.get("sizes_and_hashes", []):
-        path = seed_dir / item["relative_path"]
+    declared = manifest.get("sizes_and_hashes", []) if isinstance(manifest, dict) else []
+    if not isinstance(declared, list) or not declared:
+        return False, ["清单中没有文件"], []
+    for item in declared:
+        if not isinstance(item, dict):
+            missing.append("清单中的文件记录无效")
+            continue
+        try:
+            path = safe_path(seed_dir, item.get("relative_path", ""))
+        except ValueError as exc:
+            missing.append(str(exc))
+            continue
         if not path.is_file():
             missing.append(f"缺少必需文件：{item['relative_path']}（源路径 {item.get('source_path', '?')}）")
             continue
         if item.get("size_bytes") and path.stat().st_size != item["size_bytes"]:
             missing.append(f"{item['relative_path']} 字节数不符")
         digest = item.get("sha256")
-        if digest and sha256_file(path).lower() != str(digest).lower():
+        if not digest:
+            missing.append(f"{item['relative_path']} 缺少 SHA-256")
+        elif sha256_file(path).lower() != str(digest).lower():
             mismatched.append(f"{item['relative_path']} SHA-256 不符")
     return not missing and not mismatched, missing, mismatched
 
 
 def reconcile(db: Database, paths: Paths) -> dict[str, Any]:
     """§5 启动时对账：接回有效包，残缺包继续排队。"""
-    report: dict[str, Any] = {"attached": [], "incomplete": [], "requeued": []}
+    report: dict[str, Any] = {"attached": [], "incomplete": [], "requeued": [], "checks": []}
     paths.seeds.mkdir(parents=True, exist_ok=True)
 
+    for previous in paths.seeds.glob(".previous-*"):
+        name = previous.name.removeprefix(".previous-")
+        if not previous.is_dir() or previous.is_symlink() or not name:
+            continue
+        current = safe_path(paths.seeds, name)
+        if not current.exists():
+            previous.rename(current)
+            continue
+        seed = db.get_seed(name)
+        try:
+            installed = json.loads((current / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            installed = None
+        if seed and isinstance(installed, dict) and seed.manifest == installed:
+            shutil.rmtree(previous, ignore_errors=True)
+        else:
+            # The database commit did not happen. Preserve the new files separately.
+            current.rename(paths.seeds / f".interrupted-{name}-{uuid.uuid4().hex[:8]}")
+            previous.rename(current)
     # 磁盘上有清单但数据库没有记录 → 接回有效包。
     known = {s.rel_dir for s in db.list_seeds()}
     for directory in sorted(paths.seeds.iterdir()):
         manifest_path = directory / "manifest.json"
-        if not directory.is_dir() or not manifest_path.exists() or directory.name in known:
+        if directory.name.startswith('.') or not directory.is_dir() or not manifest_path.exists() or directory.name in known:
             continue
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not isinstance(manifest, dict):
+            continue
         candidate_id = manifest.get("candidate_id") or db.get_meta(f"candidate-of:{directory.name}", "")
         from .models import Seed
         seed = Seed(id=directory.name, candidate_id=candidate_id, rel_dir=directory.name,
                     manifest=manifest, completeness=0.0,
-                    offline_ready=bool(manifest.get("offline_verification", {}).get("passed")))
+                    offline_ready=False)
         db.put_seed(seed)
         report["attached"].append(directory.name)
 
@@ -264,10 +309,15 @@ def reconcile(db: Database, paths: Paths) -> dict[str, Any]:
             except (OSError, ValueError):
                 manifest = {}
         ok, missing, mismatched = verify_seed(directory, manifest)
+        if not (directory / "USAGE.md").is_file():
+            ok = False
+            missing.append("缺少 USAGE.md")
         ratio, _ = compute_completeness(directory, manifest)
         seed.completeness = ratio
         seed.manifest = manifest
-        if ok and (directory / "USAGE.md").exists():
+        report["checks"].append({"seed_id": seed.id, "ok": ok, "completeness": ratio,
+                                 "missing": missing, "mismatched": mismatched})
+        if ok:
             seed.integrity = "ok"
         else:
             seed.integrity = "incomplete"
@@ -277,14 +327,23 @@ def reconcile(db: Database, paths: Paths) -> dict[str, Any]:
             candidate = db.get_candidate(seed.candidate_id)
             db.set_candidate_state(seed.candidate_id, "downloaded",
                                    "文件已下载，正在验证离线启动。")
-            if candidate:
+            if candidate and candidate.source != "local":
+                plan = DownloadPlan(candidate_id=candidate.id, repo=candidate.repo,
+                                    commit_rev=manifest.get("source", {}).get("fixed_revision") or candidate.commit_rev,
+                                    files=candidate.files,
+                                    runtime_config=RuntimeConfig(**manifest.get("runtime_config", {})))
                 job = Job(id=f"recover-{seed.id}", kind="install",
                           candidate_id=candidate.id,
                           idempotency_key=candidate.idempotency_key,
                           state="queued", stage="排队",
-                          message="启动对账发现残缺包，继续排队按同一版本续跑")
-                _, created = db.create_job(job)
-                if created:
-                    report["requeued"].append(job.id)
+                          message="启动对账发现残缺包，继续排队按同一版本续跑",
+                          payload={"plan": plan.model_dump(), "mode": manifest.get("collection_mode", "local"),
+                                   "assignments": []})
+                with db.transaction():
+                    recovery_job, created = db.create_job(job)
+                    if recovery_job.state in ("done", "failed", "waiting_network", "waiting_resource", "queued"):
+                        db.update_job(recovery_job.id, state="queued", stage="排队", progress=0.0,
+                                      message=job.message, payload=job.payload)
+                        report["requeued"].append(recovery_job.id)
         db.put_seed(seed)
     return report

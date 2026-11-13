@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from .config import EVAL_VERSION, FIXED_CONCURRENCY, FIXED_CONTEXT, PROMOTION, Paths
+from .config import EVAL_VERSION, FIXED_CONCURRENCY, FIXED_CONTEXT, PROMOTION
 from .models import Candidate, EvaluationRecord, PROFILE_LABELS, PROFILES
 
 # §4 能力按用户任务分类；同一个包可以服务多项能力和多个档位。
@@ -110,7 +110,8 @@ def sota_leaders(candidates: list[Candidate]) -> dict[str, list[dict]]:
         for e in c.evidence:
             if (e.benchmark_key and e.metric and e.url and e.variant == c.variant
                     and e.model_version == c.commit_rev and e.value is not None
-                    and math.isfinite(e.value)):
+                    and math.isfinite(e.value)
+                    and (c.source != "huggingface" or e.benchmark_key.startswith("explicit-v2:"))):
                 groups.setdefault((c.task, e.benchmark_key, e.metric, e.higher_is_better), []).append((c, e))
     leaders: dict[str, list[dict]] = {}
     for (_, _, _, higher), entries in groups.items():
@@ -196,7 +197,7 @@ def grade_case(case: dict[str, Any], output: str) -> tuple[bool, str]:
         except (ValueError, TypeError):
             return False, f"输出不是合法 JSON：{text[:80]}"
         keys = expect.get("keys", [])
-        ok = all(k in obj for k in keys)
+        ok = isinstance(obj, dict) and all(k in obj for k in keys)
         return ok, f"期望 JSON 键 {keys}；实际 {str(obj)[:80]}"
     return False, f"未知评分规则 {kind}"
 
@@ -233,6 +234,12 @@ def meets_gates(record: EvaluationRecord, config: dict[str, Any]) -> tuple[bool,
     return True, "通过质量、稳定性、等待时间与离线门槛"
 
 
+def comparison_key(record: EvaluationRecord) -> tuple:
+    return (record.eval_version, record.hardware_fingerprint, record.backend, record.runner_version,
+            *(record.params.get(key) for key in
+              ("context", "concurrency", "gpu_layers", "chat_template", "temperature", "projection")))
+
+
 def promote(current: EvaluationRecord | None, challenger: EvaluationRecord,
             profile: str, config: dict[str, Any]) -> tuple[bool, str]:
     """§4 换档门槛：速度档快 10%、精度档多通过 2 个样本、平衡分高 0.03。"""
@@ -241,6 +248,8 @@ def promote(current: EvaluationRecord | None, challenger: EvaluationRecord,
         return False, reason
     if current is None or not meets_gates(current, config)[0]:
         return True, "当前档位无有效版本，候选通过全部门槛后设为默认"
+    if comparison_key(current) != comparison_key(challenger):
+        return False, "评测硬件、后端、构建或运行参数不同，需按同一条件重测"
     if profile == "speed":
         gain = (current.median_latency_ms - challenger.median_latency_ms) / max(1.0, current.median_latency_ms)
         if gain < PROMOTION["speed_min_relative_gain"]:
@@ -248,7 +257,7 @@ def promote(current: EvaluationRecord | None, challenger: EvaluationRecord,
         return True, f"端到端时间快 {gain:.1%}"
     if profile == "accuracy":
         extra = challenger.passed_cases - current.passed_cases
-        if extra < PROMOTION["accuracy_extra_passed_cases"] and challenger.quality <= current.quality:
+        if extra < PROMOTION["accuracy_extra_passed_cases"]:
             return False, f"质量未提高（多通过 {extra} 个样本，门槛 {PROMOTION['accuracy_extra_passed_cases']}）"
         return True, f"质量分 {challenger.quality:.2f}，多通过 {extra} 个样本"
     delta = challenger.score_balanced - current.score_balanced

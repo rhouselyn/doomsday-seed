@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import HTTPException, Request
 
-from .config import ALLOWED_TEXT_SUFFIXES, LOOPBACK_HOST, MAX_UPLOAD_BYTES, Paths
+from .config import ALLOWED_TEXT_SUFFIXES, MAX_UPLOAD_BYTES, Paths
 from .db import Database
 
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}

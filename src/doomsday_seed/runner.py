@@ -7,13 +7,12 @@ CPU 为基础回退。多模态按支持情况加载匹配 mmproj。推理与评
 """
 from __future__ import annotations
 
-import os
 import socket
 import subprocess
 import threading
 import time
 from collections import deque
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -21,8 +20,9 @@ from typing import Any, Callable, Iterator
 import httpx
 
 from .adapters import get_adapter
-from .config import LOOPBACK_HOST, Paths
+from .config import LOOPBACK_HOST, Paths, safe_path
 from .db import Database
+from .locks import LockBusy, file_lock
 from .models import Candidate, HardwareSample, RuntimeConfig, Seed
 from .runtime_registry import RuntimeRegistry, _offline_env
 
@@ -113,6 +113,9 @@ class InferenceService:
         self._resources = ResourceManager()
         self._lock = threading.RLock()
         self._server: RunningServer | None = None
+        self._runtime_lease = ExitStack()
+        self._runtime_users = 0
+        self._idle_timer: threading.Timer | None = None
         # 复测在暂存区进行；注册后 _load 走同一套公共接口，不绕过适配器。
         self._staging: dict[str, tuple[Path, dict[str, Any]]] = {}
         self.last_cold_start_ms: float = 0.0
@@ -142,13 +145,12 @@ class InferenceService:
                        if s.manifest.get("variant") == model and s.offline_ready]
             if matches:
                 seed = matches[0]
-        if seed is None or not seed.offline_ready or seed.manifest.get("task", "chat") != "chat":
+        if (seed is None or not seed.offline_ready or seed.integrity != "ok"
+                or seed.manifest.get("task", "chat") != "chat"):
             raise RuntimeUnavailable(
                 "本机暂无可运行模型：请先完成一次下载与离线验证；断网时不回退到云。",
                 "no_model")
         seed_dir = self.paths.seeds / seed.rel_dir
-        if not seed_dir.exists():
-            raise RuntimeUnavailable(f"种子目录缺失：{seed.rel_dir}；请检查清单并重新归档", "no_model")
         manifest = seed.manifest
         cfg = RuntimeConfig(**(manifest.get("runtime_config") or {}))
         candidate = self.db.get_candidate(seed.candidate_id)
@@ -186,16 +188,27 @@ class InferenceService:
         weight, projection = self._weight(seed)
         if not weight:
             raise RuntimeUnavailable(f"清单中没有权重文件：{seed.rel_dir}", "runtime")
+        try:
+            weight_path = safe_path(seed_dir, weight)
+            if not weight_path.is_file():
+                raise ValueError(f"缺少权重文件：{weight}")
+            if cfg.extra_args:
+                raise ValueError("不允许清单中的额外启动参数")
+        except ValueError as exc:
+            raise RuntimeUnavailable(str(exc), "runtime") from exc
         args = list(command) + [
             "--host", LOOPBACK_HOST, "--port", str(port),
-            "-m", str((seed_dir / weight).resolve()),
+            "-m", str(weight_path),
             "-c", str(cfg.context), "-np", str(cfg.concurrency),
         ]
         if backend == "cuda":
             args += ["-ngl", str(cfg.gpu_layers)]
         if cfg.mmproj or projection:
             mmproj = cfg.mmproj or projection
-            path = seed_dir / mmproj
+            try:
+                path = safe_path(seed_dir, mmproj)
+            except ValueError as exc:
+                raise RuntimeUnavailable(str(exc), "runtime") from exc
             if not path.exists():
                 raise RuntimeUnavailable(f"缺少匹配的 mmproj 投影文件：{mmproj}", "runtime")
             args += ["--mmproj", str(path.resolve())]
@@ -233,7 +246,7 @@ class InferenceService:
                     f"运行器冷启动退出（码 {proc.returncode}）：{diag['log_tail'][-500:]}",
                     "runtime")
             try:
-                resp = httpx.get(server.base_url + health, timeout=2.0)
+                resp = httpx.get(server.base_url + health, timeout=2.0, trust_env=False)
                 if resp.status_code == 200:
                     server.cold_start_ms = (time.perf_counter() - started) * 1000
                     self.last_cold_start_ms = server.cold_start_ms
@@ -256,19 +269,69 @@ class InferenceService:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait()
 
     def stop_all(self) -> None:
         with self._lock:
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
             self._terminate(self._server)
             self._server = None
+            if not self._runtime_users:
+                self._runtime_lease.close()
 
     @contextmanager
-    def _session(self, seed: Seed, seed_dir: Path, cfg: RuntimeConfig,
-                 interactive: bool) -> Iterator[RunningServer]:
-        with self._resources.acquire(seed.id, interactive):
+    def reserve(self, key: str, *, interactive=False, keep_warm=False):
+        with self._resources.acquire(key, interactive):
+            with self._lock:
+                if self._idle_timer:
+                    self._idle_timer.cancel()
+                    self._idle_timer = None
+                elif not self._runtime_users:
+                    try:
+                        self._runtime_lease.enter_context(file_lock(self.paths.data / "runtime.lock", wait=180))
+                    except LockBusy as exc:
+                        raise RuntimeUnavailable(str(exc), "waiting_resource") from exc
+                self._runtime_users += 1
+                if not keep_warm:
+                    self._terminate(self._server)
+                    self._server = None
+            try:
+                yield
+            finally:
+                with self._lock:
+                    self._runtime_users -= 1
+                    if not self._runtime_users:
+                        if keep_warm and self._server:
+                            timer = None
+
+                            def expire():
+                                with self._lock:
+                                    if self._idle_timer is timer:
+                                        self.stop_all()
+
+                            timer = self._idle_timer = threading.Timer(15, expire)
+                            timer.daemon = True
+                            timer.start()
+                        else:
+                            self.stop_all()
+
+    @contextmanager
+    def _session(self, model: str, interactive: bool) -> Iterator[tuple[RunningServer, Seed, RuntimeConfig]]:
+        # Resolve again after acquiring the cross-process lease, in case a migration
+        # or revalidation changed the archive while this request was waiting.
+        seed, _, _, _ = self._load(model)
+        with self.reserve(seed.id, interactive=interactive, keep_warm=True):
+            configured = self.db.get_settings().download_root
+            if configured != self.paths.download_root:
+                self.paths.set_download_root(configured)
+            seed, _, cfg, seed_dir = self._load(model)
             with self._lock:
                 started_new = False
-                if self._server is None or self._server.seed_id != seed.id:
+                if (self._server is None or self._server.seed_id != seed.id
+                        or self._server.config.fingerprint() != cfg.fingerprint()
+                        or self._server.process.poll() is not None):
                     self._terminate(self._server)
                     self._server = None
                     backend = self.backend_for(cfg)
@@ -288,19 +351,19 @@ class InferenceService:
                 server = self._server
                 # 同一进程内的后续请求不算冷启动，冷启动单独计时。
                 self.last_cold_start_ms = server.cold_start_ms if started_new else 0.0
-            yield server
+            yield server, seed, cfg
 
     # ---------- 公共聊天接口 ----------
     def chat(self, model: str, messages: list[dict[str, Any]], *, stream: bool = False,
              temperature: float | None = None, max_tokens: int | None = None,
              interactive: bool = True) -> dict[str, Any]:
-        seed, _, cfg, seed_dir = self._load(model)
-        adapter = get_adapter(cfg.adapter)
-        payload = adapter.chat_payload(messages, stream=False, temperature=temperature,
-                                       max_tokens=max_tokens, model=seed.id)
-        with self._session(seed, seed_dir, cfg, interactive) as server:
+        with self._session(model, interactive) as (server, seed, cfg):
+            adapter = get_adapter(cfg.adapter)
+            payload = adapter.chat_payload(messages, stream=False, temperature=temperature,
+                                           max_tokens=max_tokens, model=seed.id)
             try:
-                resp = httpx.post(server.base_url + adapter.chat_path, json=payload, timeout=180.0)
+                resp = httpx.post(server.base_url + adapter.chat_path, json=payload,
+                                  timeout=180.0, trust_env=False)
                 resp.raise_for_status()
                 data = resp.json()
             except httpx.HTTPError as exc:
@@ -313,15 +376,14 @@ class InferenceService:
     def chat_stream(self, model: str, messages: list[dict[str, Any]], *,
                     temperature: float | None = None, max_tokens: int | None = None,
                     interactive: bool = True) -> Iterator[str]:
-        seed, _, cfg, seed_dir = self._load(model)
-        adapter = get_adapter(cfg.adapter)
-        payload = adapter.chat_payload(messages, stream=True, temperature=temperature,
-                                       max_tokens=max_tokens, model=seed.id)
-        with self._session(seed, seed_dir, cfg, interactive) as server:
+        with self._session(model, interactive) as (server, seed, cfg):
+            adapter = get_adapter(cfg.adapter)
+            payload = adapter.chat_payload(messages, stream=True, temperature=temperature,
+                                           max_tokens=max_tokens, model=seed.id)
             finished = False
             try:
                 with httpx.stream("POST", server.base_url + adapter.chat_path,
-                                  json=payload, timeout=180.0) as resp:
+                                  json=payload, timeout=180.0, trust_env=False) as resp:
                     resp.raise_for_status()
                     for line in resp.iter_lines():
                         chunk = adapter.translate_stream(
@@ -345,8 +407,7 @@ class InferenceService:
         self._staging.pop(seed_id, None)
         with self._lock:
             if self._server and self._server.seed_id == seed_id:
-                self._terminate(self._server)
-                self._server = None
+                self.stop_all()
 
     def start_staging_server(self, seed_id: str, cfg: RuntimeConfig,
                              backend: str | None = None) -> RunningServer:
@@ -360,7 +421,8 @@ class InferenceService:
         adapter = get_adapter(server.config.adapter)
         payload = adapter.chat_payload(messages, stream=stream, max_tokens=max_tokens,
                                        model=server.seed_id)
-        resp = httpx.post(server.base_url + adapter.chat_path, json=payload, timeout=90.0)
+        resp = httpx.post(server.base_url + adapter.chat_path, json=payload,
+                          timeout=90.0, trust_env=False)
         resp.raise_for_status()
         return adapter.parse_response(resp.json(), server.seed_id, server.backend)
 
@@ -370,8 +432,11 @@ class InferenceService:
 
     def models(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        ready = {s.id: s for s in self.db.list_seeds()
+                 if s.offline_ready and s.integrity == "ok"
+                 and s.manifest.get("task", "chat") == "chat"}
         for pointer in self.db.list_defaults():
-            if not pointer.seed_id:
+            if pointer.task != "chat" or pointer.seed_id not in ready:
                 continue
             out.append({
                 "id": f"{pointer.task}:{pointer.profile}", "object": "model",
@@ -379,9 +444,7 @@ class InferenceService:
                 "doomsday": {"kind": "alias", "seed_id": pointer.seed_id,
                              "pinned": pointer.pinned, "source": pointer.source},
             })
-        for seed in self.db.list_seeds():
-            if seed.manifest.get("task", "chat") != "chat":
-                continue
+        for seed in ready.values():
             cfg = seed.manifest.get("runtime_config", {})
             out.append({
                 "id": seed.id, "object": "model", "created": 0, "owned_by": "local",

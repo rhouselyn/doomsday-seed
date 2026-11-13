@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -13,13 +15,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .catalog import (PROFILE_DEFS, TASKS, load_eval_config, profile_view, rank,
+from .catalog import (TASKS, comparison_key, load_eval_config, meets_gates, profile_view, rank,
                       task_view, promote, sota_leaders)
-from .config import APP_NAME, APP_TAGLINE, APP_VERSION, EVAL_VERSION, LOOPBACK_HOST
+from .config import APP_NAME, APP_TAGLINE, APP_VERSION, EVAL_VERSION
 from .discovery import LICENSE_ALLOWLIST, local_adapter
 from .hardware import budget
+from .locks import LockBusy
+from .downloader import sha256_file
 from .models import (JOB_STATE_LABELS, PROFILES, STATE_ICONS, STATE_LABELS,
-                     ChatCompletionRequest, ChatMessage, DefaultPointer, Settings, utc_now)
+                     ChatCompletionRequest, ChatMessage, Settings, utc_now)
 from .runner import RuntimeUnavailable
 from . import media
 from .agent import AgentUnavailable, DeepSeekClient
@@ -34,7 +38,7 @@ def get_service(request: Request):
 class SettingsPayload(BaseModel):
     auto_update: bool = True
     schedule_enabled: bool = True
-    schedule_time: str = "03:00"
+    schedule_time: str = Field(default="03:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     agent_enabled: bool = True
     agent_base_url: str | None = None
     agent_model: str | None = None
@@ -49,7 +53,7 @@ class DownloadPayload(BaseModel):
     candidate_id: str
     task: str = "chat"
     profile: str = "balanced"
-    mode: Literal["local", "sota"] = "local"
+    mode: Literal["local", "sota", "requested"] = "local"
 
 
 class PreferencePayload(BaseModel):
@@ -124,7 +128,7 @@ def status(service=Depends(get_service)):
     online = not settings.simulated_offline and not source.get("last_error")
     seeds = db.list_seeds()
     offline_ready = [s for s in seeds if s.offline_ready and s.integrity == "ok"]
-    jobs = db.list_jobs(limit=20)
+    active_count = db.query_one("SELECT COUNT(*) AS n FROM jobs WHERE state NOT IN ('done', 'failed')")["n"]
     return {
         "app": {"name": APP_NAME, "tagline": APP_TAGLINE, "version": APP_VERSION},
         "network": {"online": online,
@@ -147,9 +151,10 @@ def status(service=Depends(get_service)):
                       "success": db.get_meta("last_sync_success") or None,
                       "status": db.get_meta("last_sync_status") or None,
                       "skip_reason": _safe_json(db.get_meta("last_sync_skip_reason"))},
-        "counts": {"candidates": len(db.list_candidates()), "seeds": len(seeds),
+        "catalog_revision": db.revision(),
+        "counts": {"candidates": db.query_one("SELECT COUNT(*) AS n FROM candidates")["n"], "seeds": len(seeds),
                    "offline_ready": len(offline_ready),
-                   "active_jobs": sum(1 for j in jobs if j.state not in ("done", "failed"))},
+                   "active_jobs": active_count},
         "available_now": [{"task": s.manifest.get("task", "chat"),
                            "variant": s.manifest.get("variant", s.id),
                            "seed_id": s.id} for s in offline_ready],
@@ -192,17 +197,23 @@ def catalog(task: str | None = None, profile: str | None = None,
         raise HTTPException(400, f"未知能力：{task}")
     if profile and profile not in PROFILES:
         raise HTTPException(400, f"未知档位：{profile}")
-    rankings = sota_leaders(db.list_candidates(task=task))
-    candidates = db.list_candidates(task=task, state=state)
-    jobs = db.list_jobs(limit=200)
+    all_candidates = db.list_candidates(task=task)
+    rankings = sota_leaders(all_candidates)
+    candidates = [c for c in all_candidates if not state or c.state == state]
+    seeds = db.list_seeds()
+    seeds_by_id = {seed.id: seed for seed in seeds}
+    seeds_by_candidate = {seed.candidate_id: seed for seed in reversed(seeds)}
+    latest_by_candidate = {record.candidate_id: record for record in db.list_evaluations(latest_only=True)}
+    jobs_by_candidate = {}
+    for job in db.list_jobs(limit=200):
+        jobs_by_candidate.setdefault(job.candidate_id, []).append(job)
     items = []
     for c in candidates:
-        evals = db.list_evaluations(candidate_id=c.id)
-        seed = db.find_seed_by_candidate(c.id)
+        seed = seeds_by_candidate.get(c.id)
         if mode == "sota" and c.id not in rankings and not (seed and seed.manifest.get("collection_mode") == "sota"):
             continue
-        related_jobs = [j for j in jobs if j.candidate_id == c.id][:5]
-        latest = evals[0] if evals else None
+        related_jobs = jobs_by_candidate.get(c.id, [])[:5]
+        latest = latest_by_candidate.get(c.id)
         items.append({
             **c.model_dump(),
             "state_label": STATE_LABELS.get(c.state, c.state),
@@ -230,14 +241,14 @@ def catalog(task: str | None = None, profile: str | None = None,
                       "offline_ready": seed.offline_ready, "integrity": seed.integrity,
                       "rel_dir": seed.rel_dir,
                       "collection_mode": seed.manifest.get("collection_mode", "local")} if seed else None),
-            "jobs": [{"id": j.id, "state": j.state,
+            "jobs": [{"id": j.id, "state": j.state, "mode": j.payload.get("mode", "local"),
                       "state_label": JOB_STATE_LABELS.get(j.state, j.state),
                       "progress": j.progress, "message": j.message} for j in related_jobs],
             "download_progress": (max((j.progress for j in related_jobs), default=0.0)),
         })
     defaults = []
     for pointer in db.list_defaults():
-        seed = db.get_seed(pointer.seed_id) if pointer.seed_id else None
+        seed = seeds_by_id.get(pointer.seed_id)
         defaults.append({**pointer.model_dump(),
                          "variant": seed.manifest.get("variant") if seed else None,
                          "offline_ready": bool(seed and seed.offline_ready)})
@@ -257,7 +268,7 @@ def seed_detail(seed_id: str, service=Depends(get_service)):
     seed = db.get_seed(seed_id)
     if seed is None:
         raise HTTPException(404, f"种子不存在：{seed_id}")
-    directory = paths.seeds / seed.rel_dir
+    directory = paths.resolve_download_root(db.get_settings().download_root) / seed.rel_dir
     usage = ""
     if (directory / "USAGE.md").exists():
         usage = (directory / "USAGE.md").read_text(encoding="utf-8")
@@ -368,37 +379,65 @@ def run_agent_discovery(service=Depends(get_service)):
 def get_settings(service=Depends(get_service)):
     settings = service.db.get_settings()
     return {**settings.model_dump(), "effective": service.scheduler.status(),
-            "seeds_dir": str(service.paths.seeds),
+            "seeds_dir": str(service.paths.resolve_download_root(settings.download_root)),
             "default_seeds_dir": str(service.paths.default_seeds),
             "agent_mode": "rules" if service.gateway.client.name == "local-rule-agent" else "remote"}
 
 
-def _move_library(service, target: Path) -> None:
-    """归档根目录切换：现有模型一并移动，避免模型库忽然变空。"""
-    paths = service.paths
-    source = paths.seeds.resolve()
-    target = target.resolve()
-    if source == target:
-        return
-    if source in target.parents or target in source.parents:
-        raise HTTPException(400, "新目录不能与当前归档目录互相包含")
-    active = [j for j in service.db.list_jobs(limit=200)
-              if j.state not in ("done", "failed")]
-    if active:
-        raise HTTPException(409, "仍有下载或验证任务在进行，请完成后再修改保存位置")
-    target.mkdir(parents=True, exist_ok=True)
-    for child in source.iterdir():
-        if (target / child.name).exists():
-            raise HTTPException(409, f"目标目录已存在同名项目：{child.name}")
-    import shutil
-    for child in source.iterdir():
-        shutil.move(str(child), str(target / child.name))
-    paths.set_download_root(str(target))
+def save_settings(service, settings: Settings) -> Settings:
+    """Copy and verify before publishing a new library root."""
+    paths, db = service.paths, service.db
+    target = paths.resolve_download_root(settings.download_root)
+    settings.download_root = "" if target == paths.default_seeds.resolve() else str(target)
+    if settings.download_root == db.get_settings().download_root:
+        return db.put_settings(settings)
+    try:
+        with service.pipeline.library_lock(), service.inference.reserve("move-library"):
+            source = paths.seeds.resolve()
+            if source == target:
+                return db.put_settings(settings, update_download_root=True)
+            if (source in target.parents or target in source.parents
+                    or target == paths.data or target in paths.data.parents
+                    or (target.is_relative_to(paths.data) and target != paths.default_seeds.resolve())):
+                raise HTTPException(400, "新目录不能与当前归档目录互相包含或指向数据目录")
+            if db.query_one("SELECT id FROM jobs WHERE state NOT IN ('done', 'failed') LIMIT 1"):
+                raise HTTPException(409, "仍有下载或验证任务，请完成后再修改保存位置")
+            if target.exists() and any(target.iterdir()):
+                raise HTTPException(409, "请选择空目录，避免覆盖现有文件")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".seed-move-", dir=target.parent) as temp:
+                stage = Path(temp) / "library"
+                shutil.copytree(source, stage)
+                for copied in stage.rglob("*"):
+                    if copied.is_file() and sha256_file(copied) != sha256_file(source / copied.relative_to(stage)):
+                        raise OSError(f"迁移文件校验失败：{copied.name}")
+                if target.exists():
+                    target.rmdir()
+                stage.rename(target)
+                try:
+                    paths.set_download_root(settings.download_root)
+                    saved = db.put_settings(settings, update_download_root=True)
+                except BaseException:
+                    paths.set_download_root(str(source))
+                    target.rename(stage)
+                    raise
+            # Database points to the verified copy. An interrupted cleanup leaves only redundant files.
+            for child in source.iterdir():
+                try:
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                except OSError:
+                    pass
+            return saved
+    except (LockBusy, RuntimeUnavailable) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.put("/api/settings")
 def put_settings(payload: SettingsPayload, service=Depends(get_service)):
-    db, paths = service.db, service.paths
+    db = service.db
     old = db.get_settings()
     for task, profiles in payload.subscriptions.items():
         if task not in TASKS:
@@ -412,27 +451,22 @@ def put_settings(payload: SettingsPayload, service=Depends(get_service)):
     download_root = old.download_root if payload.download_root is None else payload.download_root.strip()
     if base_url and not base_url.lower().startswith(("http://", "https://")):
         raise HTTPException(400, "调用链接需要以 http:// 或 https:// 开头")
-    try:
-        target = paths.resolve_download_root(download_root)
-        _move_library(service, target)
-    except HTTPException:
-        raise
-    except (OSError, ValueError) as exc:
-        raise HTTPException(400, f"保存位置不可用：{exc}") from exc
-    effective_root = "" if target == paths.default_seeds.resolve() else str(target)
     settings = Settings(auto_update=payload.auto_update,
                         schedule_enabled=payload.schedule_enabled,
                         schedule_time=payload.schedule_time,
                         agent_enabled=payload.agent_enabled,
                         agent_base_url=base_url, agent_model=model_name,
-                        download_root=effective_root,
+                        download_root=download_root,
                         subscriptions=subscriptions,
                         download_modes=old.download_modes,
                         sota_subscriptions=old.sota_subscriptions,
                         trusted_publishers=payload.trusted_publishers,
                         manual_repos=payload.manual_repos,
                         simulated_offline=payload.simulated_offline)
-    saved = db.put_settings(settings)
+    try:
+        saved = save_settings(service, settings)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, f"保存位置不可用：{exc}") from exc
     service.gateway.enabled = saved.agent_enabled
     service.reload_agent_client()
     effective = service.scheduler.status()
@@ -441,7 +475,8 @@ def put_settings(payload: SettingsPayload, service=Depends(get_service)):
             or (saved.schedule_enabled and not effective.get("registered"))):
         effective = service.scheduler.apply_settings(saved) | service.scheduler.status()
     return {**saved.model_dump(), "effective": effective,
-            "seeds_dir": str(paths.seeds), "default_seeds_dir": str(paths.default_seeds),
+            "seeds_dir": str(service.paths.resolve_download_root(saved.download_root)),
+            "default_seeds_dir": str(service.paths.default_seeds),
             "agent_mode": "rules" if service.gateway.client.name == "local-rule-agent" else "remote",
             "note": "返回的是实际生效状态；任务计划注册失败时以 effective 为准"}
 
@@ -534,20 +569,22 @@ def put_default(task: str, profile: str, payload: DefaultPayload,
         pointer.source = "auto"
         pointer.previous_seed_id = old_seed
         config = load_eval_config()
-        records = [e for e in db.list_evaluations(eval_version=config["version"])]
-        candidates = []
-        for record in records:
-            seed = db.find_seed_by_candidate(record.candidate_id)
-            if record.task == task and seed and seed.offline_ready and seed.integrity == "ok":
-                candidates.append((record, seed))
-        if candidates:
-            ranked = rank([r for r, _ in candidates], profile)
-            best = ranked[0]
-            best_seed = next(s for r, s in candidates if r.id == best.id)
-            ok, reason = promote(None, best, profile, config)
-            if ok:
-                pointer.seed_id = best_seed.id
-            db.set_meta(f"auto_recommend:{task}:{profile}", reason)
+        hardware = service.hardware().fingerprint()
+        records = db.list_evaluations(eval_version=config["version"], latest_only=True)
+        seeds = {s.candidate_id: s for s in reversed(db.list_seeds())}
+        eligible = [e for e in records if e.task == task and e.hardware_fingerprint == hardware
+                    and e.runner_version == service.registry.version(e.backend) and meets_gates(e, config)[0]
+                    and e.candidate_id in seeds and seeds[e.candidate_id].offline_ready
+                    and seeds[e.candidate_id].integrity == "ok"]
+        old = next((e for e in eligible if seeds[e.candidate_id].id == old_seed), None)
+        # Compare against the existing configuration, or use the latest eligible configuration.
+        baseline = old or (eligible[0] if eligible else None)
+        if baseline:
+            best = rank([e for e in eligible if comparison_key(e) == comparison_key(baseline)], profile)[0]
+            pointer.seed_id = seeds[best.candidate_id].id
+            db.set_meta(f"auto_recommend:{task}:{profile}", "已从本机同条件合格成绩中选择")
+        else:
+            db.set_meta(f"auto_recommend:{task}:{profile}", "暂无本机当前评测口径的合格成绩")
         db.set_default(pointer)
     elif payload.seed_id:
         seed = db.get_seed(payload.seed_id)
@@ -641,8 +678,11 @@ def infer(req: InferPayload, service=Depends(get_service)):
         picture = media.decode_image(req.inputs.image)
         entry = next(item for item in seed.manifest["sizes_and_hashes"] if item["kind"] == "weight")
         from .debug_tools import safe_path
-        weight = safe_path(service.paths.seeds / seed.rel_dir, entry["relative_path"])
-        outputs = media.detect(service.paths, req.task, weight, picture)
+        from uuid import uuid4
+        with service.inference.reserve(f"media-{uuid4()}", interactive=True):
+            configured = service.db.get_settings().download_root
+            weight = safe_path(service.paths.resolve_download_root(configured) / seed.rel_dir, entry["relative_path"])
+            outputs = media.detect(service.paths, req.task, weight, picture)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:

@@ -6,17 +6,17 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .agent import AgentContext, AgentGateway, controlled_suggestions
+from .agent import AgentContext, AgentGateway
 from .catalog import CONTROLLED_CANDIDATES, load_eval_config
-from .config import FIXED_CONCURRENCY, FIXED_CONTEXT, MAX_NEW_VARIANTS_PER_TASK_PROFILE_PER_RUN, Paths
+from .config import DEFAULT_TRUSTED_PUBLISHERS, FIXED_CONCURRENCY, FIXED_CONTEXT, MAX_NEW_VARIANTS_PER_TASK_PROFILE_PER_RUN, Paths
 from .db import Database
-from .discovery import DiscoveryResult, LICENSE_ALLOWLIST, local_adapter
-from .downloader import resolve_fixed_commit
-from .hardware import budget, check_capacity
+from .discovery import DiscoveryResult, HuggingFaceSource, LICENSE_ALLOWLIST, local_adapter
+from .hardware import budget, check_capacity, estimate_footprint
 from .models import Candidate, DownloadPlan, Estimate, Evidence, FileSpec, HardwareSample, RuntimeConfig, Settings
 
 
@@ -52,36 +52,48 @@ class ShortlistResult:
 
 class PreSelector:
     def __init__(self, db: Database, paths: Paths, gateway: AgentGateway | None = None,
-                 commit_resolver: Callable[[str, str], str] | None = None):
+                 commit_resolver: Callable[[str, str], str] | None = None,
+                 source: HuggingFaceSource | None = None):
         self.db = db
         self.paths = paths
         self.gateway = gateway or AgentGateway()
         # 可注入以便离线测试；生产环境把分支引用解析成不可变 commit。
-        self.commit_resolver = commit_resolver or resolve_fixed_commit
+        self.commit_resolver = commit_resolver
+        self.source = source or HuggingFaceSource(db)
 
     def store_discovery(self, result: DiscoveryResult, settings: Settings) -> list[Candidate]:
         """目录与作业分开记录；受控候选始终在目录中，供 Agent 失败时兜底。"""
         for candidate in controlled_candidates():
             self.db.upsert_candidate(candidate)
         stored: list[Candidate] = []
-        for candidate in result.candidates:
-            stored.append(self.db.upsert_candidate(candidate))
+        with self.db.transaction():
+            for candidate in result.candidates:
+                stored.append(self.db.upsert_candidate(candidate))
+            for source, cursor in result.cursors.items():
+                self.db.mark_source_success(source, cursor)
+            if "huggingface" in result.cursors:
+                scope = sorted(settings.trusted_publishers or DEFAULT_TRUSTED_PUBLISHERS)
+                self.db.set_meta("hf-paginated-scope", json.dumps(scope))
         return stored
 
     def rule_filter(self, candidate: Candidate, sample: HardwareSample,
-                    settings: Settings) -> tuple[bool, str, dict[str, Any]]:
+                    settings: Settings, *, installed=None, active=None) -> tuple[bool, str, dict[str, Any]]:
         if candidate.state == "gated":
             return False, "受限访问模型，留在「待授权」，由用户在线办理", {}
         if local_adapter(candidate) != "llamacpp-openai":
             return False, f"{candidate.task} 属于后续阶段，本轮只登记元数据", {}
         if not candidate.license or candidate.license not in LICENSE_ALLOWLIST:
             return False, "无法确认来源或许可，停在候选状态", {}
-        if self.db.find_seed_by_candidate(candidate.id):
+        if installed is None:
+            installed = {seed.candidate_id for seed in self.db.list_seeds()}
+        if candidate.id in installed:
             return False, "已归档版本直接复用，不重复下载", {}
         # 已存在未完成作业也由 create_job 的幂等键吸收，这里显式标注原因。
-        for job in self.db.list_jobs(limit=200):
-            if job.candidate_id == candidate.id and job.state not in ("done", "failed"):
-                return False, "同一变体已有在途作业，跨档复用", {}
+        if active is None:
+            active = {r["candidate_id"] for r in self.db.query(
+                "SELECT candidate_id FROM jobs WHERE state NOT IN ('done','failed')")}
+        if candidate.id in active:
+            return False, "同一变体已有在途作业，跨档复用", {}
 
         backend = candidate.estimate.backend or "cpu"
         if backend == "cuda" and not sample.backend_available.get("cuda", False):
@@ -94,10 +106,12 @@ class PreSelector:
 
         capacity = {"fits": True, "reason": "文件元数据待下载预检补齐", "backend": backend}
         if candidate.size_bytes > 0:
+            estimate = estimate_footprint(
+                sum(f.size_bytes for f in candidate.files if f.kind == "weight"),
+                projection_bytes=sum(f.size_bytes for f in candidate.files if f.kind == "projection"),
+                backend=backend, gpu_layers=99 if backend == "cuda" else 0)
             capacity = check_capacity(
-                {"est_ram_mib": candidate.estimate.est_ram_mib,
-                 "est_vram_mib": candidate.estimate.est_vram_mib if backend == "cuda" else 0},
-                sample, backend)
+                estimate, sample, backend)
             if not capacity["fits"]:
                 # §3「允许建议更低配置或已验证的 CPU 版本；没有合适版本就显示本机暂无可运行模型」
                 suggestion = ("显存余量不足。可试用速度优先档，或稍后重试。"
@@ -117,11 +131,14 @@ class PreSelector:
         fixed_pairs = {(c.repo, c.variant) for c in candidates
                        if re.fullmatch(r"[0-9a-f]{7,40}", c.commit_rev or "")}
 
+        installed = {seed.candidate_id for seed in self.db.list_seeds()}
+        active = {r["candidate_id"] for r in self.db.query(
+            "SELECT candidate_id FROM jobs WHERE state NOT IN ('done','failed')")}
         eligible: list[dict[str, Any]] = []
         by_key: dict[str, Candidate] = {}
         seen_rv: set[tuple[str, str]] = set()
         for candidate in candidates:
-            ok, reason, capacity = self.rule_filter(candidate, sample, settings)
+            ok, reason, capacity = self.rule_filter(candidate, sample, settings, installed=installed, active=active)
             by_key[candidate.idempotency_key] = candidate
             controlled = candidate.rationale.startswith("[受控候选]")
             if controlled and (candidate.repo, candidate.variant) in fixed_pairs:
@@ -184,31 +201,22 @@ class PreSelector:
                     break
                 if suggestion.task != task or (suggestion.profile and suggestion.profile != profile):
                     continue
-                # §5：固定 commit 是下载幂等键的一部分，分支引用必须先解析。
-                commit = suggestion.commit_rev
-                if not re.fullmatch(r"[0-9a-f]{7,40}", commit or ""):
-                    try:
-                        commit = self.commit_resolver(suggestion.repo, commit)
-                    except Exception as exc:
-                        out.skipped.append({"repo": suggestion.repo,
-                                            "variant": suggestion.variant,
-                                            "reason": f"等待网络：无法解析固定 commit（{exc}）"})
-                        continue
-                key = f"huggingface|{suggestion.repo}|{commit}|{suggestion.variant}"
+                key = f"huggingface|{suggestion.repo}|{suggestion.commit_rev}|{suggestion.variant}"
                 candidate = by_key.get(key) or self.db.find_candidate_by_key(key)
-                if candidate is None:
-                    # 受控候选可能尚未在目录里（首次运行且来源失败）；解析后按固定 commit 登记。
-                    for c in controlled_candidates():
-                        if (c.repo, c.variant) == (suggestion.repo, suggestion.variant):
-                            c.commit_rev = commit
-                            c.id = Candidate.make_id(c.source, c.repo, commit, c.variant)
-                            c.rationale = f"[受控候选] 固定修订 {commit[:12]}；" + c.rationale
-                            candidate = self.db.upsert_candidate(c)
-                            by_key[candidate.idempotency_key] = candidate
-                            break
                 if candidate is None:
                     out.skipped.append({"repo": suggestion.repo, "variant": suggestion.variant,
                                         "reason": "建议未对应到目录中的候选，已忽略"})
+                    continue
+                try:
+                    ref = candidate.commit_rev
+                    if self.commit_resolver and not re.fullmatch(r"[0-9a-f]{40}", ref):
+                        ref = self.commit_resolver(candidate.repo, ref)
+                    fixed = self.source.pin(candidate, ref)
+                    by_key[key] = fixed
+                    candidate = fixed
+                except Exception as exc:
+                    out.skipped.append({"repo": suggestion.repo, "variant": suggestion.variant,
+                                        "reason": f"无法确认固定版本的文件清单：{exc}"})
                     continue
                 if candidate.id in seen:
                     out.assignments.append({"task": task, "profile": profile,
@@ -216,7 +224,7 @@ class PreSelector:
                                             "reason": "同一变体入围多档，只下载一次"})
                     added += 1
                     continue
-                ok, reason, capacity = self.rule_filter(candidate, sample, settings)
+                ok, reason, capacity = self.rule_filter(candidate, sample, settings, installed=installed, active=active)
                 if not ok:
                     out.skipped.append({"candidate_id": candidate.id, "repo": candidate.repo,
                                         "variant": candidate.variant, "reason": reason})
