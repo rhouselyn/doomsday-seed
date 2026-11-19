@@ -11,13 +11,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .agent import AgentContext, AgentGateway
-from .catalog import CONTROLLED_CANDIDATES, load_eval_config
-from .config import DEFAULT_TRUSTED_PUBLISHERS, FIXED_CONCURRENCY, FIXED_CONTEXT, MAX_NEW_VARIANTS_PER_TASK_PROFILE_PER_RUN, Paths
+from .agent import AgentContext, AgentGateway, LocalRuleAgent
+from .catalog import CONTROLLED_CANDIDATES, TASKS, load_eval_config
+from .config import DEFAULT_TRUSTED_PUBLISHERS, FIXED_CONCURRENCY, FIXED_CONTEXT, MAX_NEW_VARIANTS_PER_TASK_PROFILE_PER_RUN, MIB, Paths
 from .db import Database
 from .discovery import DiscoveryResult, HuggingFaceSource, LICENSE_ALLOWLIST, local_adapter
 from .hardware import budget, check_capacity, estimate_footprint
-from .models import Candidate, DownloadPlan, Estimate, Evidence, FileSpec, HardwareSample, RuntimeConfig, Settings
+from .models import PROFILES, Candidate, DownloadPlan, Estimate, Evidence, FileSpec, HardwareSample, RuntimeConfig, Settings
 
 
 def controlled_candidates() -> list[Candidate]:
@@ -60,6 +60,67 @@ class PreSelector:
         # 可注入以便离线测试；生产环境把分支引用解析成不可变 commit。
         self.commit_resolver = commit_resolver
         self.source = source or HuggingFaceSource(db)
+
+    def recommendations(self, candidates: list[Candidate], sample: HardwareSample,
+                        settings: Settings, rankings: dict[str, list[dict]]) -> dict[str, dict[str, str]]:
+        """每种能力每档至多一个固定版本。归档和作业状态不参与排名。"""
+        backends = dict(sample.backend_available)
+        if sample.os.startswith("Windows ") and sample.arch.lower() in {"amd64", "x86_64"}:
+            backends["cpu"] = True  # Windows x64 可在用户授权下载后安装锁定构建。
+        capacity = sample.model_copy(update={"ram_available_mib": sample.ram_total_mib,
+                                             "vram_available_mib": sample.vram_total_mib,
+                                             "backend_available": backends})
+        choices = []
+        by_variant = set()
+        sota: dict[str, Candidate] = {}
+        # 同一仓库变体优先采用最近发现的固定版本，旧归档仍可单独使用。
+        for candidate in sorted(candidates, key=lambda c: (c.created_at, c.id), reverse=True):
+            weights = [f for f in candidate.files if f.kind in {"weight", "projection"}]
+            if (candidate.task not in TASKS or candidate.source not in {"huggingface", "mediapipe"}
+                    or candidate.state == "gated" or candidate.license not in LICENSE_ALLOWLIST
+                    or not any(f.kind == "weight" for f in weights)
+                    or any(f.size_bytes <= 0 for f in weights)
+                    or (candidate.source == "huggingface"
+                        and not re.fullmatch(r"[0-9a-f]{40}", candidate.commit_rev))):
+                continue
+            previous = sota.get(candidate.task)
+            evidence = rankings.get(candidate.id, [])
+            previous_evidence = rankings.get(previous.id, []) if previous else []
+            if any(e["compared"] > 1 or e.get("public_rank") for e in evidence) and (
+                    min((e.get("public_rank") or float("inf") for e in evidence), default=float("inf")),
+                    -len(evidence)) < (
+                    min((e.get("public_rank") or float("inf") for e in previous_evidence), default=float("inf")),
+                    -len(previous_evidence)):
+                sota[candidate.task] = candidate
+
+            key = (candidate.task, candidate.repo, candidate.variant)
+            if key in by_variant:
+                continue
+            by_variant.add(key)
+            adapter = local_adapter(candidate)
+            if TASKS[candidate.task]["enabled"] and adapter != "mediapipe" and (
+                    not adapter or not self.rule_filter(
+                        candidate, capacity, settings, installed=set(), active=set())[0]):
+                continue
+            choices.append({"id": candidate.id, "repo": candidate.repo, "variant": candidate.variant,
+                            "commit_rev": candidate.commit_rev, "task": candidate.task,
+                            "chat_tuned": candidate.state == "offline_ready" or bool(re.search(
+                                r"(?:^|[-_/. ])(?:instruct(?:ion)?|chat|it)(?:$|[-_/. ])",
+                                f"{candidate.repo} {candidate.variant}", re.IGNORECASE)),
+                            "eligible": True, "est_ram_mib": candidate.size_bytes / MIB})
+
+        if any(c["task"] == "chat" and c["chat_tuned"] for c in choices):
+            choices = [c for c in choices if c["task"] != "chat" or c["chat_tuned"]]
+        pairs = [[task, profile] for task in sorted({c["task"] for c in choices}) for profile in PROFILES]
+        slots: dict[str, dict[str, str]] = {
+            task: {"sota": candidate.id} for task, candidate in sota.items()
+        }
+        ids = {(c["task"], c["repo"], c["commit_rev"], c["variant"]): c["id"] for c in choices}
+        context = AgentContext(candidates=choices, subscriptions=pairs, max_suggestions=len(pairs))
+        for suggestion in LocalRuleAgent().recommend(context):
+            key = (suggestion.task, suggestion.repo, suggestion.commit_rev, suggestion.variant)
+            slots.setdefault(suggestion.task, {})[suggestion.profile] = ids[key]
+        return slots
 
     def store_discovery(self, result: DiscoveryResult, settings: Settings) -> list[Candidate]:
         """目录与作业分开记录；受控候选始终在目录中，供 Agent 失败时兜底。"""

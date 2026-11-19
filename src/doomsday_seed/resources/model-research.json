@@ -1,0 +1,471 @@
+[
+  {
+    "task": "translation",
+    "variant": "Qwen-MT-Lumen",
+    "repo": "ATH-MaaS/Qwen-MT-Lumen",
+    "commit_rev": "3bf800fcf95d8ae7e58c6f2221fd1e100d9dfca8",
+    "license": "Apache-2.0",
+    "release_url": "https://huggingface.co/ATH-MaaS/Qwen-MT-Lumen/tree/3bf800fcf95d8ae7e58c6f2221fd1e100d9dfca8",
+    "brief": {
+      "ability": "把文本翻译到目标语言，覆盖多个语种方向。",
+      "effect": "WMT26 通用翻译受限赛道人评中，23 个方向有 20 个进入首位统计组。",
+      "limit": "这是提交系统的人评成绩，包含后处理和修复步骤。独立加载权重不一定复现。"
+    },
+    "integration": "固定提交的 model_shards/ 包含模型和分词器。复现 WMT26 结果还需按系统论文准备结构感知推理、后处理和选择性修复。",
+    "evidence": [
+      {
+        "title": "WMT26 通用机器翻译 · 受限赛道",
+        "metric": "进入首位统计组的方向数",
+        "value": 20,
+        "unit": "/23",
+        "url": "https://www2.statmt.org/wmt26/pdf/2026.wmt-1.48.pdf",
+        "public_rank": 1,
+        "independent": true,
+        "note": "官方 Findings 第 6.3 节，cESA 人评，统计首组内允许多系统并列。"
+      },
+      {
+        "title": "WMT26 Lumen 系统论文",
+        "url": "https://aclanthology.org/2026.wmt-main.81/",
+        "note": "公开了提交系统与单次权重推理之间的差异。"
+      }
+    ]
+  },
+  {
+    "task": "translation",
+    "variant": "Index-Translate-35B-A3B-preview",
+    "repo": "IndexTeam/Index-Translate-35B-A3B-preview",
+    "commit_rev": "7e4029e0df842502cb009cf493d6467c247043b3",
+    "license": "Apache-2.0",
+    "release_url": "https://huggingface.co/IndexTeam/Index-Translate-35B-A3B-preview/tree/7e4029e0df842502cb009cf493d6467c247043b3",
+    "brief": {
+      "ability": "把文本翻译成指定语言，并按指令保留格式或执行定制翻译。",
+      "effect": "在发布论文的 FLORES 翻译和 instTrans 指令遵循对比中领跑。",
+      "limit": "这是预览版，论文成绩不能覆盖所有语种组合或专业领域。"
+    },
+    "integration": "按官方模型卡使用 Transformers 或 vLLM，输入原文、目标语言及所需格式；预览版的模板和推理参数以上游为准。",
+    "evidence": [
+      {
+        "title": "FLORES",
+        "metric": "COMET-22",
+        "value": 0.8794,
+        "unit": "",
+        "url": "https://arxiv.org/html/2609.40181",
+        "note": "发布方论文表 4；非思考模式，语言方向等权。",
+        "public_rank": 1
+      },
+      {
+        "title": "instTrans",
+        "metric": "IFscore",
+        "value": 0.8336,
+        "unit": "",
+        "url": "https://arxiv.org/html/2609.40181",
+        "note": "论文表 4，与通用翻译质量分开。",
+        "public_rank": 1
+      }
+    ]
+  },
+  {
+    "task": "translation",
+    "variant": "Hy-MT2-30B-A3B",
+    "repo": "tencent/Hy-MT2-30B-A3B",
+    "commit_rev": "见官方发布",
+    "license": "Apache-2.0",
+    "release_url": "https://huggingface.co/tencent/Hy-MT2-30B-A3B",
+    "brief": {
+      "ability": "多语文本翻译，适用于需要保留源文本结构的场景。",
+      "effect": "另一发布方论文的 WMT24++ 对比中，公开分数领先。",
+      "limit": "WMT24++ 与 FLORES 涵盖语言和文本不同，不直接比较分数。"
+    },
+    "integration": "使用官方 Transformers 聊天模板指定目标语言；术语和上下文建议按发布配置提供。",
+    "evidence": [
+      {
+        "title": "WMT24++",
+        "metric": "COMET-22",
+        "value": 0.8624,
+        "unit": "",
+        "url": "https://arxiv.org/html/2609.40181",
+        "note": "论文表 4 中该测试集的最高分。",
+        "public_rank": 1
+      }
+    ]
+  },
+  {
+    "task": "image_gen",
+    "variant": "Qwen-Image-2.1",
+    "repo": "Qwen/Qwen-Image-2.1",
+    "commit_rev": "d26bb61231c349cf6b7896fa83353113880e1ba3",
+    "license": "Qwen Research License",
+    "release_url": "https://huggingface.co/Qwen/Qwen-Image-2.1/tree/d26bb61231c349cf6b7896fa83353113880e1ba3",
+    "brief": {
+      "ability": "从文字提示生成图片，包含可见文字的画面也可尝试。",
+      "effect": "在 Arena 开放权重文生图组的人类盲选中领先。",
+      "limit": "偏好结果来自评测所用服务配置。权重许可仅适用非商业研究与评估。"
+    },
+    "integration": "使用官方 Diffusers 的 QwenImage21Pipeline，输入提示词和目标尺寸，输出图片。",
+    "evidence": [
+      {
+        "title": "Arena 文生图",
+        "metric": "Elo",
+        "value": 1227,
+        "unit": "",
+        "url": "https://arena.ai/leaderboard/image/text-to-image?license=open-source",
+        "note": "2026-11-16 开放权重组，17,794 票，区间 ±6。",
+        "public_rank": 1,
+        "arena_config": "text_to_image"
+      }
+    ],
+    "arena_name": "Qwen-Image-2.1"
+  },
+  {
+    "task": "image_gen",
+    "variant": "Qwen-Image (2512)",
+    "repo": "Qwen/Qwen-Image-2512",
+    "commit_rev": "25468b98e3276ca6700de15c6628e51b7de54a26",
+    "license": "Apache-2.0",
+    "release_url": "https://huggingface.co/Qwen/Qwen-Image-2512/tree/25468b98e3276ca6700de15c6628e51b7de54a26",
+    "brief": {
+      "ability": "从文字生成图像，支持中文与英文提示。",
+      "effect": "在同一 Arena 文生图组有公开人类偏好成绩。",
+      "limit": "人类偏好总分不代表提示词中的文字始终准确。"
+    },
+    "integration": "使用官方 Diffusers 管线，选择合适的分辨率和采样配置。",
+    "evidence": [
+      {
+        "title": "Arena 文生图",
+        "metric": "Elo",
+        "value": 1124,
+        "unit": "",
+        "url": "https://arena.ai/leaderboard/image/text-to-image?license=open-source",
+        "note": "2026-11-16 开放权重组公开分数，区间 ±3。",
+        "public_rank": 8,
+        "arena_config": "text_to_image"
+      }
+    ],
+    "arena_name": "Qwen-Image (2512)"
+  },
+  {
+    "task": "image_edit",
+    "variant": "MiniMax-H3-Image",
+    "repo": "MiniMaxAI/MiniMax-H3-Image",
+    "commit_rev": "见官方发布",
+    "license": "MiniMax H3 Image Community License",
+    "release_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3-Image",
+    "brief": {
+      "ability": "给已有图片加文字指令，修改指定内容、风格或构图。",
+      "effect": "在 Artificial Analysis 开放权重图像编辑测试中领先。",
+      "limit": "两份榜单名次不同。默认配置指向另一仓库的文本编码器，接入前需核对配套组件与社区许可。"
+    },
+    "integration": "按 MiniMax 官方 Diffusers 配置加载图像版和文本编码器，再传入图片和编辑指令。",
+    "evidence": [
+      {
+        "title": "AA 图像编辑 v2.1",
+        "metric": "Elo",
+        "value": 1135,
+        "unit": "",
+        "url": "https://artificialanalysis.ai/image/leaderboard/editing/open-weights",
+        "note": "开放权重组，3,267 个样本，95% 区间 ±16。",
+        "public_rank": 1,
+        "aa_name": "H3-Image"
+      },
+      {
+        "title": "Arena 图像编辑",
+        "metric": "Elo",
+        "value": 1358,
+        "unit": "",
+        "url": "https://arena.ai/leaderboard/image/image-edit/single-image?license=open-source",
+        "note": "开放权重组的整体人类偏好。",
+        "public_rank": 2,
+        "arena_config": "image_edit"
+      }
+    ],
+    "arena_name": "MiniMax H3-Image"
+  },
+  {
+    "task": "image_edit",
+    "variant": "Qwen-Image-2.1",
+    "repo": "Qwen/Qwen-Image-2.1",
+    "commit_rev": "d26bb61231c349cf6b7896fa83353113880e1ba3",
+    "license": "Qwen Research License",
+    "release_url": "https://huggingface.co/Qwen/Qwen-Image-2.1/tree/d26bb61231c349cf6b7896fa83353113880e1ba3",
+    "brief": {
+      "ability": "按文字要求编辑参考图，也支持生成新图。",
+      "effect": "Arena 与 Artificial Analysis 对该版本有不同的相对名次。",
+      "limit": "权重仅供非商业研究与评估。榜单成绩不能直接推断编辑后的人物或文字始终精确。"
+    },
+    "integration": "按官方 QwenImage21Pipeline 的编辑示例传入参考图和提示词，输出编辑后的图片。",
+    "evidence": [
+      {
+        "title": "AA 图像编辑 v2.1",
+        "metric": "Elo",
+        "value": 1082,
+        "unit": "",
+        "url": "https://artificialanalysis.ai/image/leaderboard/editing/open-weights",
+        "note": "开放权重组，95% 区间 ±13。",
+        "public_rank": 3,
+        "aa_name": "Qwen-Image-2.1"
+      },
+      {
+        "title": "Arena 图像编辑",
+        "metric": "Elo",
+        "value": 1363,
+        "unit": "",
+        "url": "https://arena.ai/leaderboard/image/image-edit/single-image?license=open-source",
+        "note": "开放权重组的整体人类偏好。",
+        "public_rank": 1,
+        "arena_config": "image_edit"
+      }
+    ],
+    "arena_name": "Qwen-Image-2.1"
+  },
+  {
+    "task": "face_swap",
+    "variant": "InsightFace 换脸模型系列",
+    "repo": "deepinsight/insightface",
+    "commit_rev": "见官方发布",
+    "license": "预训练权重仅非商业研究，详情见作者声明",
+    "release_url": "https://github.com/deepinsight/insightface#license",
+    "brief": {
+      "ability": "把来源图片中的脸部身份迁移到目标图片。",
+      "effect": "在 CASIA 论文对比中，普通场景的身份检索达到 96.92%。",
+      "limit": "论文标为 InsightFace 系列，未公开足够信息把成绩绑定到一个具体权重。身份检索也不衡量画面自然度。"
+    },
+    "integration": "根据作者的许可和官方发布核对可取得的换脸组件。接入时需单独确认版本和脸部检测依赖。",
+    "evidence": [
+      {
+        "title": "CASIA FaceSwapping Benchmark",
+        "metric": "普通场景身份检索率",
+        "value": 96.92,
+        "unit": "%",
+        "url": "https://arxiv.org/html/2605.00883",
+        "note": "表 V，对比 14 个方法。跨族裔 97.19%，跨属性 95.14%。",
+        "public_rank": 1
+      }
+    ]
+  },
+  {
+    "task": "pose",
+    "variant": "Sapiens2 Pose 5B",
+    "repo": "facebook/sapiens2-pose-5b",
+    "commit_rev": "见官方发布",
+    "license": "Sapiens2 License",
+    "release_url": "https://huggingface.co/facebook/sapiens2-pose-5b",
+    "brief": {
+      "ability": "从人体图片中估计全身关键点，包含躯干、手脚和脸部区域。",
+      "effect": "发布论文在 Sociopticon 的 308 点全身任务中报告 82.3% mAP。",
+      "limit": "这个分数对应特定数据和检测流程。遮挡、截断和小人物会影响结果。"
+    },
+    "integration": "按 Sapiens2 官方姿态管线提供人体框和图片，再映射返回的关键点坐标。使用模型卡标注的权重和输入尺寸。",
+    "evidence": [
+      {
+        "title": "Sociopticon 308 点全身姿态",
+        "metric": "mAP",
+        "value": 82.3,
+        "unit": "%",
+        "url": "https://arxiv.org/html/2604.21681",
+        "note": "发布论文表 3，同表 mAR 85.3%。",
+        "public_rank": 1
+      }
+    ]
+  },
+  {
+    "task": "hand",
+    "variant": "S2HAND-Pose-5B v0.1.0-rc3",
+    "repo": "mage0001/S2HAND",
+    "commit_rev": "见官方发布",
+    "license": "以上游 Sapiens2 基座与增量权重条款为准",
+    "release_url": "https://github.com/ronggong000/S2HAND",
+    "brief": {
+      "ability": "估计图片中的手部关节位置，适合包含遮挡和交叠手部的场景。",
+      "effect": "论文跨三个手部数据集报告 65.73% 宏平均 AUC@0.20。",
+      "limit": "发布的是增量权重，需要匹配上游基座与指定校验值。论文分数不等同于跟踪视频时的稳定性。"
+    },
+    "integration": "按作者发布说明匹配 Sapiens2 基座和增量校验，再使用其姿态评测或推理入口。",
+    "evidence": [
+      {
+        "title": "HInt、COCO WholeBody、FreiHAND",
+        "metric": "宏平均 AUC@0.20",
+        "value": 65.73,
+        "unit": "%",
+        "url": "https://arxiv.org/html/2611.10416",
+        "note": "论文报告公开 Sapiens2 基座为 57.83%；COCO 手部 AP 提升 12.89 个百分点。",
+        "public_rank": 1
+      }
+    ]
+  },
+  {
+    "task": "tts",
+    "variant": "Drama 3",
+    "repo": "fishaudio/drama-3",
+    "commit_rev": "见官方发布",
+    "license": "Fish Audio Community License",
+    "release_url": "https://huggingface.co/fishaudio/drama-3",
+    "brief": {
+      "ability": "按文本合成语音，使用发布方音色生成对白或旁白。",
+      "effect": "在 Artificial Analysis 开放权重供应商预设音色组中领先。",
+      "limit": "该成绩衡量参测的预设音色，不能外推到未测语言或任意参考声音。"
+    },
+    "integration": "按官方推理文档传入文本，使用上游指定的音色与合成配置，输出音频。",
+    "evidence": [
+      {
+        "title": "AA 语音合成 · 供应商预设音色",
+        "metric": "Elo",
+        "value": 1279,
+        "unit": "",
+        "url": "https://artificialanalysis.ai/text-to-speech/leaderboard/provider-voice/open-weights",
+        "note": "公开结果 1,990 个样本、8 个声音，区间 ±16。",
+        "public_rank": 1,
+        "aa_name": "Fish Audio Drama 3"
+      }
+    ]
+  },
+  {
+    "task": "video_gen",
+    "variant": "MiniMax H3",
+    "repo": "MiniMaxAI/MiniMax-H3",
+    "commit_rev": "见官方发布",
+    "license": "MiniMax H3 Community License",
+    "release_url": "https://huggingface.co/MiniMaxAI/MiniMax-H3",
+    "brief": {
+      "ability": "由文字或参考图生成视频，官方也提供联动生成音频的版本。",
+      "effect": "在 Arena 开放权重文生视频组的公开票选中领先。",
+      "limit": "榜单人类偏好不等同于音画同步测试；社区许可另有适用范围和限制。"
+    },
+    "integration": "按官方文生视频配置准备各组件，提供提示词、目标分辨率和时长。单独核对所选版本是否输出音频。",
+    "evidence": [
+      {
+        "title": "Arena 文生视频",
+        "metric": "Elo",
+        "value": 1456,
+        "unit": "",
+        "url": "https://arena.ai/leaderboard/video/text-to-video?license=open-source",
+        "note": "2026-11-08 开放权重组，29,257 票，区间 ±8。",
+        "public_rank": 1,
+        "arena_config": "text_to_video"
+      }
+    ],
+    "arena_name": "MiniMax H3"
+  },
+  {
+    "task": "video_gen",
+    "variant": "Kandinsky 5.0 Video Pro",
+    "repo": "kandinskylab/Kandinsky-5.0-T2V-Pro-sft-5s-Diffusers",
+    "commit_rev": "7271a43778448e4756a0a822ceb9e46cf52a42b2",
+    "license": "MIT",
+    "release_url": "https://huggingface.co/kandinskylab/Kandinsky-5.0-T2V-Pro-sft-5s-Diffusers/tree/7271a43778448e4756a0a822ceb9e46cf52a42b2",
+    "brief": {
+      "ability": "按文字提示生成短视频。",
+      "effect": "在 Arena 开放权重文生视频组有公开排名。",
+      "limit": "榜单所用服务未固定到这个五秒权重的提交，名次只关联模型系列。"
+    },
+    "integration": "按上游 Diffusers 文档选择五秒文生视频权重，输入提示词并导出视频帧。",
+    "evidence": [
+      {
+        "title": "Arena 文生视频",
+        "metric": "Elo",
+        "value": 1175,
+        "unit": "",
+        "url": "https://arena.ai/leaderboard/video/text-to-video?license=open-source",
+        "note": "榜单展示模型系列，区间 ±21。",
+        "public_rank": 2,
+        "arena_config": "text_to_video"
+      }
+    ],
+    "arena_name": "Kandinsky 5.0 Video Pro"
+  },
+  {
+    "task": "tts",
+    "variant": "Ming-3.0-tts-tiny",
+    "repo": "inclusionAI/Ming-3.0-tts-tiny",
+    "commit_rev": "4715ef5a2f02901f75687d538b6920fd0dd11e6b",
+    "license": "MIT",
+    "release_url": "https://huggingface.co/inclusionAI/Ming-3.0-tts-tiny/tree/4715ef5a2f02901f75687d538b6920fd0dd11e6b",
+    "brief": {
+      "ability": "用文本和参考音频合成语音。",
+      "effect": "官方模型卡公布中文和英文的合成评测。",
+      "limit": "这一组是错误率测试，和偏好榜的 Elo 不同。"
+    },
+    "integration": "使用发布方提供的推理代码并选择对应的小模型。",
+    "evidence": [
+      {
+        "title": "Seed-TTS 中文测试",
+        "metric": "发布方标注的 WER",
+        "value": 0.82,
+        "unit": "%",
+        "url": "https://huggingface.co/inclusionAI/Ming-3.0-tts-tiny",
+        "note": "官方卡的英语错误率为 1.666%，中文和英文的 SIM 为 .781 和 .728。"
+      }
+    ]
+  },
+  {
+    "task": "pose",
+    "variant": "DWPose-l 384×288",
+    "repo": "yzd-v/DWPose",
+    "commit_rev": "1a7144101628d69ee7a3768d1ee3a094070dc388",
+    "license": "Apache-2.0",
+    "release_url": "https://huggingface.co/yzd-v/DWPose/tree/1a7144101628d69ee7a3768d1ee3a094070dc388",
+    "brief": {
+      "ability": "为图片中的人预测全身关键点。",
+      "effect": "官方报告 COCO-WholeBody 全身 AP 66.5。",
+      "limit": "数据集和人体检测器不同，不能与 Sociopticon 的 AP 直接比较。"
+    },
+    "integration": "从原仓库选择 384×288 的 DWPose-l ONNX 并配套人体检测器。",
+    "evidence": [
+      {
+        "title": "COCO-WholeBody v1.0 val",
+        "metric": "身体 AP",
+        "value": 72.2,
+        "unit": "",
+        "url": "https://github.com/IDEA-Research/DWPose",
+        "note": "官方结果对应 384×288，检测器人体 AP 56.4。"
+      }
+    ]
+  },
+  {
+    "task": "hand",
+    "variant": "DWPose-l 384×288",
+    "repo": "yzd-v/DWPose",
+    "commit_rev": "1a7144101628d69ee7a3768d1ee3a094070dc388",
+    "license": "Apache-2.0",
+    "release_url": "https://huggingface.co/yzd-v/DWPose/tree/1a7144101628d69ee7a3768d1ee3a094070dc388",
+    "brief": {
+      "ability": "为图中人物同时估计身体与手部关键点。",
+      "effect": "COCO-WholeBody 官方对比报告手部 AP 62.1。",
+      "limit": "手部 AP 和跨集 AUC 的定义不同。"
+    },
+    "integration": "按 DWPose 说明接入姿态和人体检测两个阶段，选择 384×288 版本。",
+    "evidence": [
+      {
+        "title": "COCO-WholeBody v1.0 val",
+        "metric": "手部 AP",
+        "value": 62.1,
+        "unit": "",
+        "url": "https://github.com/IDEA-Research/DWPose",
+        "note": "同表给出检测器人体 AP 56.4。"
+      }
+    ]
+  },
+  {
+    "task": "face_swap",
+    "variant": "FaceAdapter",
+    "repo": "FaceAdapter/FaceAdapter",
+    "commit_rev": "见官方发布",
+    "license": "Apache-2.0 模型卡，配套组件单独核对",
+    "release_url": "https://huggingface.co/FaceAdapter/FaceAdapter",
+    "brief": {
+      "ability": "根据参考人脸编辑目标图像。",
+      "effect": "同一 CASIA 论文普通场景身份检索率为 95.49%。",
+      "limit": "该分数衡量身份一致性，未衡量画面自然度。"
+    },
+    "integration": "按发布方管线获取所需依赖，并核对每项权重许可。",
+    "evidence": [
+      {
+        "title": "CASIA FaceSwapping Benchmark",
+        "metric": "普通场景身份检索率",
+        "value": 95.49,
+        "unit": "%",
+        "url": "https://arxiv.org/html/2605.00883",
+        "note": "论文表 V，和 InsightFace 方法在相同条件下的结果可对照。"
+      }
+    ]
+  }
+]

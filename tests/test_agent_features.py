@@ -96,3 +96,33 @@ def test_rule_agent_assigns_multiple_profiles():
     result = LocalRuleAgent().recommend(context)
     assert [(item.profile, item.variant) for item in result] == [
         ("speed", "1"), ("balanced", "2"), ("accuracy", "3")]
+
+
+def test_public_model_review_combines_sources_without_weight_jobs(service_factory, monkeypatch):
+    from doomsday_seed import researcher
+
+    service = service_factory().service
+
+    def entry(name, rating):
+        return {"model_name": name, "rating": rating, "rating_lower": rating - 3,
+                "rating_upper": rating + 3, "vote_count": 2000, "read_date": "2026-11-19"}
+
+    def arena(config):
+        return [entry("Qwen-Image-2.1", 1363), entry("MiniMax H3-Image", 1358)] if config == "image_edit" else []
+
+    def aa(url):
+        return [entry("H3-Image", 1135), entry("Unverified weights", 1090),
+                entry("Qwen-Image-2.1", 1082)] if "/editing/" in url else []
+
+    monkeypatch.setattr(researcher, "_arena_rows", arena)
+    monkeypatch.setattr(researcher, "_aa_rows", aa)
+    researcher.refresh_reviews(service.db)
+    review = _run_tool(service, "public_model_review", {"task": "image_edit"})["models"][0]
+    assert review["variant"] == "MiniMax-H3-Image"
+    assert [e["public_rank"] for e in review["evidence"]] == [1, 2]
+    assert review["alternatives"][0]["variant"] == "Qwen-Image-2.1"
+    assert not service.db.list_jobs()
+
+    client = TestClient(create_app(service), base_url="http://127.0.0.1")
+    candidates = client.get("/api/catalog?curated=true&task=image_edit").json()["candidates"]
+    assert [c["id"] for c in candidates if c.get("reference_only")] == ["research-image_edit"]

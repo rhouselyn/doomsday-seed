@@ -103,10 +103,6 @@ class Service:
             self.startup_report = {"skipped": "种子库正在使用"}
         self.gateway.enabled = self.db.get_settings().agent_enabled
         self.pipeline.run_pending()
-        try:
-            self.startup_report["catch_up"] = self.scheduler.maybe_catch_up(self.pipeline)
-        except Exception as exc:
-            self.startup_report["catch_up_error"] = str(exc)
         return self.startup_report
 
     def shutdown(self) -> None:
@@ -121,7 +117,7 @@ class Service:
         def loop():
             while not self._stop_daily.wait(15):
                 settings = self.db.get_settings()
-                if not settings.auto_update or not settings.schedule_enabled or settings.simulated_offline:
+                if not settings.schedule_enabled or settings.simulated_offline:
                     continue
                 now = datetime.now().astimezone()
                 clock = parse_schedule_time(settings.schedule_time)

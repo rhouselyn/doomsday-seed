@@ -148,9 +148,10 @@ class ScheduleService:
                         else "非 Windows 系统，未注册任务计划")
         planned = next_run(settings.schedule_time)
         catch_up_due = False
-        if last_success and settings.auto_update and settings.schedule_enabled:
+        last_attempt = self.db.get_meta("last_sync_attempt") or last_success
+        if last_attempt and settings.schedule_enabled and not settings.simulated_offline:
             try:
-                last = datetime.fromisoformat(last_success.replace("Z", "+00:00"))
+                last = datetime.fromisoformat(last_attempt.replace("Z", "+00:00"))
                 if last.tzinfo is not None:
                     last = last.astimezone().replace(tzinfo=None)
                 today = _local_now().replace(hour=0, minute=0, second=0, microsecond=0)

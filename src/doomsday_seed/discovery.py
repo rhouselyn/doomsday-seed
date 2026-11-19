@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import (DEFAULT_TRUSTED_PUBLISHERS, HF_BACKOFF_BASE_SECONDS,
@@ -30,6 +31,23 @@ USAGE_NAMES = ("USAGE.md", "usage.md", "docs/usage.md", "examples/README.md")
 GGUF_SHARD = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf", re.I)
 CONFIG_NAMES = ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json")
 
+LIBRARY_SEARCH = {
+    "chat": ("text-generation", ""), "code": ("text-generation", "coder"),
+    "math": ("text-generation", "math"), "translation": ("translation", ""),
+    "vision": ("image-text-to-text", ""), "ocr": ("image-text-to-text", "ocr"),
+    "image_gen": ("text-to-image", ""), "image_edit": ("image-to-image", "edit"),
+    "face_swap": ("image-to-image", "face-swap"), "speech": ("automatic-speech-recognition", ""),
+    "tts": ("text-to-speech", ""), "video": ("video-classification", ""),
+    "video_gen": ("text-to-video", ""), "retrieval": ("feature-extraction", ""),
+}
+
+LIBRARY_BENCHMARKS = {
+    "chat": "TIGER-Lab/MMLU-Pro", "code": "SWE-bench/SWE-bench_Verified",
+    "math": "openai/gsm8k", "vision": "MMMU/MMMU_Pro", "ocr": "allenai/olmOCR-bench",
+    "speech": "hf-audio/open-asr-leaderboard", "retrieval": "mteb/arguana",
+    "video": "MME-Benchmarks/Video-MME-v2",
+}
+
 
 @dataclass
 class DiscoveryResult:
@@ -46,6 +64,10 @@ class DiscoveryResult:
 
 class HuggingFaceSource:
     name = "huggingface"
+
+    @property
+    def supports_public_reviews(self) -> bool:
+        return self._api is None or hasattr(self._api, "dataset_info")
 
     def __init__(self, db, api: Any | None = None, sleep: Callable[[float], None] = time.sleep):
         self.db = db
@@ -82,6 +104,145 @@ class HuggingFaceSource:
         raise RuntimeError(f"达到重试上限（{HF_MAX_RETRIES} 次）：{last}")
 
     # ---------- 扫描 ----------
+    def discover_library(self, settings: Settings) -> DiscoveryResult:
+        """查找各类型的固定文件清单。人体和手部使用应用登记的官方模型。"""
+        from .researcher import RESEARCH_REPOS
+
+        result = DiscoveryResult()
+        try:
+            api = self.api()
+        except Exception as exc:
+            error = str(exc)
+            self.db.mark_source_error(self.name, error)
+            return DiscoveryResult(status="retained", errors=[{"source": self.name, "error": error}])
+
+        def search(entry):
+            task, (tag, query) = entry
+            try:
+                items = self._call(lambda: list(api.list_models(
+                    pipeline_tag=tag, search=query or None, gated=False, sort="downloads",
+                    limit=4, token=False)))
+                return [item.id for item in items[:4]], None
+            except Exception as exc:
+                return [], {"source": self.name, "task": task, "error": str(exc)[:300]}
+
+        pinned = {repo.casefold(): task for task, repo in RESEARCH_REPOS.items()}
+        repos = dict.fromkeys([*RESEARCH_REPOS.values(), *settings.manual_repos])
+        with ThreadPoolExecutor(max_workers=HF_MAX_WORKERS) as pool:
+            for hits, error in pool.map(search, LIBRARY_SEARCH.items()):
+                repos.update(dict.fromkeys(hits))
+                if error:
+                    result.errors.append(error)
+
+        def load(repo):
+            try:
+                info = self._call(lambda: api.model_info(repo, files_metadata=True, token=False))
+                models = self._to_candidates(info)
+                for model in models:
+                    model.task = pinned.get(model.repo.casefold(), model.task)
+                return models, None
+            except Exception as exc:
+                return [], {"source": self.name, "repo": repo, "error": str(exc)[:300]}
+
+        result.scanned = len(repos)
+        candidates = {}
+        with ThreadPoolExecutor(max_workers=HF_MAX_WORKERS) as pool:
+            for models, error in pool.map(load, repos):
+                candidates.update((c.id, c) for c in models)
+                if error:
+                    result.errors.append(error)
+        leaderboard = getattr(api, "get_dataset_leaderboard", None)
+        if leaderboard:
+            def leader(entry):
+                task, dataset = entry
+                try:
+                    rows = leaderboard(dataset, token=False, timeout=12)
+                    for row in rows[:12]:
+                        try:
+                            info = api.model_info(row.model_id, files_metadata=True, token=False, timeout=12)
+                        except Exception as exc:
+                            if getattr(getattr(exc, "response", None), "status_code", None) in {401, 403, 404}:
+                                continue
+                            raise
+                        original = next((c for c in self._to_candidates(info)
+                                         if c.variant.endswith(" · 原始文件") and c.state != "gated"
+                                         and c.license in LICENSE_ALLOWLIST and c.size_bytes > 0
+                                         and all(f.size_bytes > 0 for f in c.files if f.kind == "weight")), None)
+                        if original is None:
+                            continue
+                        original.task = task
+                        original.evidence.append(Evidence(
+                            title=dataset, url=f"https://huggingface.co/datasets/{dataset}/leaderboard",
+                            source="Hugging Face 公开榜单", dataset=dataset,
+                            model_version=original.commit_rev, variant=original.variant,
+                            benchmark_key=f"hf-board:{dataset}", metric="榜单得分",
+                            value=row.value, public_rank=row.rank,
+                            note=("榜单关联发布模型，未绑定权重修订。"
+                                  + ("榜单标记为已验证。" if row.verified else "公开报告成绩。")
+                                  + (f" {row.notes[:240]}" if row.notes else "")),
+                        ))
+                        return task, original, None
+                    return task, None, None
+                except Exception as exc:
+                    return task, None, {"source": self.name, "task": task, "error": str(exc)[:300]}
+
+            with ThreadPoolExecutor(max_workers=HF_MAX_WORKERS) as pool:
+                for task, winner, error in pool.map(leader, LIBRARY_BENCHMARKS.items()):
+                    if error:
+                        result.errors.append(error)
+                        continue
+                    board_key = f"hf-board:{LIBRARY_BENCHMARKS[task]}"
+                    for old in self.db.list_candidates(task=task):
+                        if any(e.benchmark_key == board_key for e in old.evidence):
+                            old.evidence = [e for e in old.evidence if e.benchmark_key != board_key]
+                            candidates.setdefault(old.id, old)
+                    if winner:
+                        candidates[winner.id] = winner
+        result.candidates = list(candidates.values())
+        if result.errors:
+            result.status = "partial"
+            self.db.mark_source_error(self.name, result.errors[0]["error"])
+        else:
+            self.db.mark_source_success(self.name, self.db.get_source(self.name).get("cursor"))
+        return result
+
+    def cache_model_cards(self, candidates: list[Candidate]) -> None:
+        """缓存推荐版本的上游说明。只取非权重的小型文本。"""
+        try:
+            download = getattr(self.api(), "hf_hub_download", None)
+        except Exception:
+            return
+        if download is None:
+            return
+
+        jobs = {}
+        for candidate in candidates:
+            if candidate.source != "huggingface":
+                continue
+            card = next((f for f in candidate.files if f.kind == "model_card"
+                         and 0 < f.size_bytes <= 96 * 1024), None)
+            if card is None:
+                continue
+            key = f"model-card:{candidate.repo}:{candidate.commit_rev}"
+            if not self.db.get_meta(key):
+                jobs[key] = (candidate, card.repo_path)
+
+        def save(entry):
+            key, (candidate, filename) = entry
+            try:
+                path = download(candidate.repo, filename, revision=candidate.commit_rev,
+                                token=False, etag_timeout=8)
+                with Path(path).open("rb") as handle:
+                    raw = handle.read(96 * 1024 + 1)
+                if len(raw) <= 96 * 1024:
+                    self.db.set_meta(key, raw.decode("utf-8", errors="replace"))
+            except Exception:
+                # 固定版本的摘要在后续刷新中可以重试。
+                return
+
+        with ThreadPoolExecutor(max_workers=HF_MAX_WORKERS) as pool:
+            list(pool.map(save, jobs.items()))
+
     def discover(self, settings: Settings) -> DiscoveryResult:
         result = DiscoveryResult()
         scan_started = datetime.now(timezone.utc)
@@ -230,7 +391,7 @@ class HuggingFaceSource:
         license_id = str(card.get("license", "") or "").lower()
         publisher = repo.split("/")[0] if "/" in repo else ""
         pipeline = str(getattr(info, "pipeline_tag", None) or card.get("pipeline_tag", "") or "")
-        task = _pipeline_to_task(pipeline)
+        task = _pipeline_to_task(pipeline, repo)
         gated = str(getattr(info, "gated", "") or "")
         siblings = self._siblings(info)
         by_name = {s["name"]: s for s in siblings}
@@ -253,7 +414,7 @@ class HuggingFaceSource:
         if not all_variants:
             weights = weights[:2]
         package = [s for s in siblings if s["name"].lower().endswith(
-            (".safetensors", ".onnx", ".onnx_data", ".bin"))]
+            (".safetensors", ".onnx", ".onnx_data", ".bin", ".pth"))]
 
         evidence = [Evidence(
             title="上游模型卡与文件清单",
@@ -382,8 +543,20 @@ def _exact_scores(card: dict, repo: str, revision: str, variant: str) -> list[Ev
     return scores
 
 
-def _pipeline_to_task(pipeline: str) -> str:
+def _pipeline_to_task(pipeline: str, repo: str = "") -> str:
+    name = repo.rsplit("/", 1)[-1].lower()
+    if re.search(r"face[-_]?swap|inswapper", name):
+        return "face_swap"
+    if re.search(r"(?:^|[-_.])ocr(?:$|[-_.])|paddleocr", name):
+        return "ocr"
+    if pipeline == "text-generation":
+        if re.search(r"(?:^|[-_.])(?:coder|code)(?:$|[-_.])", name):
+            return "code"
+        if re.search(r"(?:^|[-_.])math(?:$|[-_.])", name):
+            return "math"
     return {
+        "translation": "translation", "sentence-similarity": "retrieval",
+        "document-question-answering": "ocr", "video-text-to-text": "video",
         "text-generation": "chat", "image-text-to-text": "vision",
         "automatic-speech-recognition": "speech", "text-to-image": "image_gen",
         "text-to-speech": "tts", "feature-extraction": "retrieval",

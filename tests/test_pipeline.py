@@ -190,3 +190,82 @@ def test_jobs_recover_after_restart(service_factory):
     updated = db.get_job("interrupted")
     assert updated.state == "queued" and updated.stage == "排队"
     assert "按同一版本续跑" in updated.message
+
+
+def test_daily_discovery_only_downloads_after_opt_in_and_reuses_jobs(service_factory, monkeypatch):
+    env = service_factory(auto_update=False)
+    svc = env.service
+    from doomsday_seed.models import HardwareSample, Settings
+
+    assert Settings().auto_update is False
+    sample = HardwareSample(ram_total_mib=8192, backend_available={"cpu": True})
+    monkeypatch.setattr(svc.pipeline, "hardware", lambda: sample)
+    monkeypatch.setattr(svc.pipeline, "_start_worker", lambda *args, **kwargs: None)
+    settings = svc.db.get_settings()
+    settings.schedule_enabled = True
+    svc.db.put_settings(settings)
+
+    pending = svc.pipeline.sync(trigger="scheduled")
+    assert pending.shortlisted and not svc.db.list_jobs()
+    from fastapi.testclient import TestClient
+    from doomsday_seed.app import create_app
+
+    client = TestClient(create_app(svc), base_url="http://127.0.0.1")
+    catalog = client.get("/api/catalog?curated=true").json()["candidates"]
+    chat = [c for c in catalog if c["task"] == "chat"]
+    assert len(chat) == 1
+    assert chat[0]["recommended_modes"] == ["speed", "balanced", "accuracy"]
+
+    settings.auto_update = True
+    svc.db.put_settings(settings)
+    assert not svc.pipeline.sync(catalog_only=True).jobs
+    first = svc.pipeline.sync(trigger="scheduled")
+    assert len(first.jobs) == 1
+    assert not svc.pipeline.sync(trigger="scheduled").jobs
+    assert len(svc.db.list_jobs()) == 1
+
+
+def test_public_leaderboard_and_model_card_work_without_local_capacity(service_factory, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from doomsday_seed.catalog import sota_leaders
+    from doomsday_seed.models import HardwareSample
+
+    env = service_factory(auto_update=False)
+    svc = env.service
+    baseline = env.api.model_info
+    card = tmp_path / "README.md"
+    card.write_text("Published capabilities and limitations", encoding="utf-8")
+    calls = []
+
+    def model_info(repo, **kwargs):
+        info = baseline(repo)
+        info.id = repo
+        info.gated = repo.endswith("/gated")
+        info.siblings.append(SimpleNamespace(rfilename="model.safetensors", size=800 * 1024**3))
+        return info
+
+    def leaderboard(dataset, **kwargs):
+        if dataset != "TIGER-Lab/MMLU-Pro":
+            return []
+        return [SimpleNamespace(model_id="org/gated", rank=1, value=90, verified=False, notes=""),
+                SimpleNamespace(model_id="org/open", rank=2, value=89, verified=False, notes="")]
+
+    def read_card(repo, filename, **kwargs):
+        calls.append((repo, filename))
+        return str(card)
+
+    monkeypatch.setattr(env.api, "model_info", model_info)
+    monkeypatch.setattr(env.api, "get_dataset_leaderboard", leaderboard, raising=False)
+    monkeypatch.setattr(env.api, "hf_hub_download", read_card, raising=False)
+    monkeypatch.setattr(svc.pipeline, "hardware", HardwareSample)
+
+    for _ in range(2):
+        report = svc.pipeline.sync(trigger="scheduled")
+        assert report.status == "ok" and not report.jobs
+    items = svc.db.list_candidates(task="chat")
+    slots = svc.preselector.recommendations(items, HardwareSample(), svc.db.get_settings(), sota_leaders(items))
+    assert set(slots["chat"]) == {"sota"}
+    winner = svc.db.get_candidate(slots["chat"]["sota"])
+    assert winner.repo == "org/open" and winner.evidence[-1].public_rank == 2
+    assert svc.db.get_meta(f"model-card:{winner.repo}:{winner.commit_rev}") == card.read_text(encoding="utf-8")
+    assert calls.count(("org/open", "README.md")) == 1

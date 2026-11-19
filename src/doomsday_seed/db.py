@@ -243,6 +243,8 @@ class Database:
                 candidate.state = existing.state
                 candidate.reason = existing.reason
             candidate.created_at = existing.created_at
+            if candidate.model_dump(exclude={"updated_at"}) == existing.model_dump(exclude={"updated_at"}):
+                return existing
         candidate.updated_at = utc_now()
         d = candidate.model_dump()
         self.execute(

@@ -21,6 +21,8 @@ def test_export_package_contains_everything_and_verifies(installed):
         assert "RESTORE.md" in names and "SHA256SUMS.txt" in names
         assert "src/doomsday_seed/web/index.html" in names and "src/doomsday_seed/web/assets/vault.webp" in names
         assert "src/doomsday_seed/web/assets/styles.css" in names and "src/doomsday_seed/web/assets/app.js" in names
+        for image in (WEB / "assets").glob("*.webp"):
+            assert f"src/doomsday_seed/web/assets/{image.name}" in names
         assert any(n.startswith("data/seeds/") and n.endswith("manifest.json") for n in names)
         assert any(n.startswith("data/seeds/") and n.endswith("USAGE.md") for n in names)
         assert any(n.startswith("src/doomsday_seed/") for n in names)
@@ -58,9 +60,13 @@ def test_web_has_no_external_assets():
         assert not re.search(r"https?://", text), f"{path.name} 含外部地址"
         assert not re.search(r"//cdn\.|fonts\.googleapis|unpkg|jsdelivr", text)
     css = (WEB / "assets/styles.css").read_text(encoding="utf-8")
+    for asset in re.findall(r'url\("/assets/([^"]+)"\)', css):
+        assert (WEB / "assets" / asset).is_file(), asset
     assert "prefers-reduced-motion" in css and ":focus-visible" in css
     html = (WEB / "index.html").read_text(encoding="utf-8")
-    assert 'src="/assets/vault.webp"' in html and (WEB / "assets/vault.webp").is_file()
+    for asset in re.findall(r'(?:src|srcset)="/assets/([^"]+)"', html):
+        assert (WEB / "assets" / asset).is_file(), asset
+    assert 'src="/assets/cavern-entrance.webp"' in html
     assert "断网演练" not in html
     assert 'id="view-settings"' in html
     assert 'id="view-discover"' not in html and 'id="view-agent"' not in html

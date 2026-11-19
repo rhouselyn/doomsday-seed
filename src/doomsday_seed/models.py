@@ -94,6 +94,7 @@ class Evidence(BaseModel):
     value: float | None = None
     higher_is_better: bool = True
     variant: str = ""
+    public_rank: int | None = None
 
 
 class Estimate(BaseModel):
@@ -234,7 +235,7 @@ class DefaultPointer(BaseModel):
 class Settings(BaseModel):
     """与 §6 `GET/PUT /api/settings` 对应。修改后返回实际生效状态。"""
 
-    auto_update: bool = True
+    auto_update: bool = False
     schedule_enabled: bool = True
     schedule_time: str = Field(default="03:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     agent_enabled: bool = True

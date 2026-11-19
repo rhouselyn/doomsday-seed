@@ -106,14 +106,19 @@ TASK_INPUTS = {
 def sota_leaders(candidates: list[Candidate]) -> dict[str, list[dict]]:
     """最高分只在同任务、基准协议、指标与方向内比较。"""
     groups: dict[tuple, list[tuple[Candidate, Any]]] = {}
+    leaders: dict[str, list[dict]] = {}
     for c in candidates:
         for e in c.evidence:
+            if (e.public_rank and e.benchmark_key.startswith("hf-board:") and e.url
+                    and e.variant == c.variant and e.model_version == c.commit_rev
+                    and e.value is not None and math.isfinite(e.value)):
+                leaders.setdefault(c.id, []).append({**e.model_dump(), "compared": 0})
+                continue
             if (e.benchmark_key and e.metric and e.url and e.variant == c.variant
                     and e.model_version == c.commit_rev and e.value is not None
                     and math.isfinite(e.value)
                     and (c.source != "huggingface" or e.benchmark_key.startswith("explicit-v2:"))):
                 groups.setdefault((c.task, e.benchmark_key, e.metric, e.higher_is_better), []).append((c, e))
-    leaders: dict[str, list[dict]] = {}
     for (_, _, _, higher), entries in groups.items():
         best = (max if higher else min)(e.value for _, e in entries)
         count = len({c.id for c, _ in entries})

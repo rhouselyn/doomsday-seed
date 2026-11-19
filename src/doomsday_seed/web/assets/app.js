@@ -9,17 +9,17 @@ const say = (id, value) => { const el = $('#' + id); if (el && el.textContent !=
 const state = {
   session: '', catalog: null, status: null, preferences: null,
   settings: null, schedule: null, agentConfig: null,
-  labTask: null, model: '', view: 'vault', refresh: null,
+  labFilter: '', labTask: null, model: '', view: 'vault', refresh: null,
   sync: false, pending: new Set(), toast: 0, chat: null, messages: [],
   image: null, fileVersion: 0, mediaRunning: false, initialized: false,
-  prefDirty: false,
+  prefDirty: false, libraryStage: 'explore', selected: new Map(), submitting: false,
 };
 const labels = {
   queued: '排队中', downloading: '下载中', verifying: '校验中',
   debugging: '准备环境', retesting: '本机验证中', waiting_network: '等待来源',
   waiting_resource: '等待本机资源', failed: '准备未完成',
 };
-const profileLabels = { speed: '速度优先', balanced: '平衡', accuracy: '精度优先' };
+const profileLabels = { speed: '速度优先', balanced: '平衡', accuracy: '精度优先', sota: 'SOTA' };
 const taskCopy = {
   pose: { description: '识别本地图片中的人体关键点，输出坐标与预览叠层', trial: '选择一张本地图片，输出人体关键点与预览叠层' },
   hand: { description: '识别本地图片中的手部关节，输出坐标与预览叠层', trial: '选择一张本地图片，输出每只手的关节坐标与预览叠层' },
@@ -74,52 +74,90 @@ function toast(message) {
   state.toast = setTimeout(() => { $('#toast').hidden = true; }, 4500);
 }
 
-function showView() {
+let passage = null;
+
+async function showView(animate = true) {
   if (location.hash && !location.hash.startsWith('#/')) return;
-  const requested = location.hash.slice(2);
-  const alias = { discover: 'library', agent: 'settings' };
   const views = ['vault', 'library', 'lab', 'settings'];
-  const next = views.includes(requested) ? requested : alias[requested] || 'vault';
-  const changed = state.view !== next;
-  state.view = next;
-  views.forEach(id => { $('#view-' + id).hidden = next !== id; });
-  $$('.navigation [data-view]').forEach(a => {
-    if (a.dataset.view === next) a.setAttribute('aria-current', 'page');
-    else a.removeAttribute('aria-current');
-  });
-  if (next === 'settings' && !state.settings) loadSettings().catch(() => {});
-  if (changed) {
-    const panel = $('#view-' + next);
-    panel.classList.add('view-arrival');
-    window.scrollTo(0, 0);
-    $('h1', panel).focus({ preventScroll: true });
+  const alias = { discover: 'library', agent: 'settings' };
+  const requested = location.hash.slice(2);
+  const next = views.includes(requested) ? requested : Object.hasOwn(alias, requested) ? alias[requested] : 'vault';
+  if (passage?.to === next) return;
+  passage?.stop();
+
+  const from = state.view;
+  if (from === next) return;
+  const panel = $('#view-' + next);
+  const scene = $('.cave-scene');
+  const blackout = $('.cave-blackout');
+  const main = $('#main');
+  const nav = $('.masthead');
+  const motions = [];
+  const trip = { to: next, stop() {
+    motions.forEach(motion => motion.cancel());
+    main.inert = nav.inert = false;
+    delete scene.dataset.mouth;
+    passage = null;
+  } };
+  passage = trip;
+
+  function play(element, frames, timing) {
+    const motion = element.animate(frames, { fill: 'both', ...timing });
+    motions.push(motion);
+    return motion;
+  }
+  function travel(mouth, direction) {
+    scene.dataset.mouth = mouth;
+    const rock = $('.gate[data-view="' + mouth + '"] .boulder', scene);
+    const timing = { duration: 1050, direction };
+    play(rock, [
+      { transform: 'none', easing: 'ease-in-out' },
+      { transform: 'translateX(var(--roll)) rotate(var(--tilt))', offset: .62 },
+      { transform: 'translateX(var(--roll)) rotate(var(--tilt))' },
+    ], timing);
+    return play(scene, [
+      { transform: 'none' },
+      { transform: 'none', offset: .32, easing: 'cubic-bezier(.5,.04,.72,1)' },
+      { transform: 'translate(calc(50% - var(--mouth-x)),calc(50% - var(--mouth-y))) scale(6)' },
+    ], timing);
+  }
+  const moving = animate && !matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const fade = (start, end, duration, delay = 0) => play(blackout, [{ opacity: start }, { opacity: end }], { duration, delay });
+  try {
+    if (moving) {
+      main.inert = nav.inert = true;
+      if (from === 'vault') travel(next, 'normal');
+      await fade(0, 1, from === 'vault' ? 290 : 320, from === 'vault' ? 760 : 0).finished;
+    }
+    state.view = next;
+    views.forEach(id => { $('#view-' + id).hidden = next !== id; });
+    if (next === 'settings' && !state.settings) loadSettings().catch(() => {});
+    if (moving) {
+      const retreat = next === 'vault' && travel(from, 'reverse');
+      await fade(1, 0, retreat ? 290 : 380).finished;
+      if (retreat) await retreat.finished;
+    }
+  } catch (error) {
+    if (error.name !== 'AbortError') throw error;
+  } finally {
+    if (passage === trip) {
+      trip.stop();
+      const focusTarget = next === 'vault' ? $('.gate[data-view="' + from + '"]') : $('h1', panel);
+      focusTarget.focus({ preventScroll: true });
+    }
   }
 }
 
 function go(view) {
-  if (location.hash !== '#/' + view) location.hash = '#/' + view;
-  showView();
-}
-
-function trace(event, control) {
-  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-  const box = control.getBoundingClientRect(), mark = document.createElement('span');
-  mark.className = 'seed-trace';
-  mark.setAttribute('aria-hidden', 'true');
-  mark.style.left = (event.detail ? event.clientX : box.left + box.width / 2) + 'px';
-  mark.style.top = (event.detail ? event.clientY : box.top + box.height / 2) + 'px';
-  document.body.append(mark);
-  mark.addEventListener('animationend', () => mark.remove(), { once: true });
-  setTimeout(() => mark.remove(), 800);
+  location.hash = '#/' + view;
 }
 
 // ---------------------------------------------------------------- 首页
 function renderHome() {
-  if (!state.status) return;
-  const counts = state.status.counts;
-  say('homeStatus', counts.offline_ready
-    ? `${counts.offline_ready} 个模型可试用${counts.active_jobs ? ' · ' + counts.active_jobs + ' 项准备中' : ''} · 权重留在本机`
-    : '还没有通过验证的模型，种子库正在按偏好准备。');
+  const counts = state.status?.counts;
+  say('homeStored', counts?.seeds ?? '—');
+  say('homeReady', counts?.offline_ready ?? '—');
+  say('homeJobs', counts?.active_jobs ?? '—');
 }
 
 // ---------------------------------------------------------------- 模型库
@@ -128,6 +166,11 @@ const taskGroups = () => {
   const present = [...new Set(state.catalog.tasks.map(t => t.group))];
   return [...GROUP_ORDER.filter(g => present.includes(g)), ...present.filter(g => !GROUP_ORDER.includes(g))];
 };
+function taskOptions() {
+  return '<option value="">全部类型</option>' + taskGroups().map(group =>
+    `<optgroup label="${esc(group || '其他')}">${state.catalog.tasks.filter(t => t.group === group)
+      .map(t => `<option value="${esc(t.id)}">${esc(t.label)}</option>`).join('')}</optgroup>`).join('');
+}
 const taskRank = taskId => {
   const index = state.catalog?.tasks.findIndex(t => t.id === taskId);
   return index < 0 ? 999 : index;
@@ -152,28 +195,32 @@ function statusOf(c) {
 }
 
 function repoLink(c) {
-  return c.source === 'huggingface' ? new URL('/' + c.repo, HF_BASE).href : '';
+  return c.source === 'huggingface' && /^[\w.-]+\/[\w.-]+$/.test(c.repo)
+    ? new URL('/' + c.repo + '/tree/' + encodeURIComponent(c.commit_rev), HF_BASE).href : '';
 }
 
 function sourceLink(url) {
   try {
     const link = new URL(url);
-    return link.protocol === 'https:' && ['huggingface.co', 'github.com', 'developers.google.com'].includes(link.hostname) ? link.href : '';
+    return link.protocol === 'https:' && ['huggingface.co', 'github.com', 'developers.google.com', 'ai.google.dev', 'arxiv.org', 'arena.ai', 'artificialanalysis.ai', 'www2.statmt.org', 'aclanthology.org', 'openaccess.thecvf.com'].includes(link.hostname) ? link.href : '';
   } catch (_) { return ''; }
 }
 
 function modelLinks(c) {
   const links = [];
-  const repo = repoLink(c);
+  const repo = sourceLink(c.release_url) || repoLink(c);
   if (repo) links.push(`<a class="text-link" href="${esc(repo)}" target="_blank" rel="noopener noreferrer">来源仓库 ↗</a>`);
   (c.evidence || []).slice(0, 1).forEach(e => {
     const url = sourceLink(e.url);
-    if (url) links.push(`<a class="text-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(e.title || '公开证据')} ↗</a>`);
+    const title = e.title || '公开证据';
+    const label = title === '上游模型卡与文件清单' ? '上游文件' : title;
+    if (url) links.push(`<a class="text-link" href="${esc(url)}" title="${esc(title)}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>`);
   });
   return links.join('');
 }
 
 function modelActions(c, bucket) {
+  if (c.reference_only) return '<span class="muted small-copy">评测参考</span>';
   if (bucket === 'stored') {
     if (ready(c)) return `<button class="button primary" type="button" data-try="${esc(c.seed.id)}">试用</button>`;
     const job = activeJob(c);
@@ -186,82 +233,164 @@ function modelActions(c, bucket) {
     if (job?.state === 'failed' || job?.state.startsWith('waiting_')) return `<button class="button outline" type="button" data-download="${esc(c.id)}" data-dmode="${esc(job.mode || 'local')}">重试</button>`;
     return '<span class="muted small-copy">准备中</span>';
   }
-  const actions = [];
-  if (!c.install_block) {
-    actions.push(`<button class="button primary" type="button" data-download="${esc(c.id)}" data-dmode="local">下载</button>`);
-  }
-  if (c.collectable && c.state !== 'gated') {
-    actions.push(`<button class="button outline" type="button" data-download="${esc(c.id)}" data-dmode="sota">收藏 SOTA</button>`);
-  }
-  return actions.join('') || '<span class="muted small-copy">暂不可下载</span>';
+  const mode = selectionMode(c);
+  if (!mode) return '<span class="muted small-copy">暂不可下载</span>';
+  return `<label class="model-select"><input type="checkbox" data-select-model="${esc(c.id)}" ${state.selected.has(c.id) ? 'checked' : ''} ${state.submitting ? 'disabled' : ''}>勾选下载</label>`;
+}
+
+function selectionMode(c) {
+  const modes = c.recommended_modes || [];
+  const filtered = $('#libraryMode').value;
+  return modes.includes(filtered) ? filtered
+    : modes.find(mode => mode !== 'sota') || modes[0];
+}
+
+function modelScores(c) {
+  return [...new Map([...(c.sota || []), ...(c.public_evidence || [])]
+    .filter(e => Number.isFinite(e.value) && e.url)
+    .map(e => [`${e.benchmark_key || e.title}|${e.metric}`, e])).values()];
+}
+
+function modelSummary(c) {
+  if (c.brief) return c.brief;
+  const task = taskInfo(c.task);
+  const score = modelScores(c)[0];
+  const measured = c.measured?.[0];
+  return {
+    ability: taskField(task, 'description') || trialCopy(task) || task?.label || '用途见发布方说明。',
+    effect: score ? `${score.title} 的公开成绩为 ${score.value}${score.unit || ''}${score.public_rank ? `，榜单第 ${score.public_rank}` : ''}。`
+      : measured ? `历史本机评测通过 ${measured.passed_cases}/${measured.total_cases} 项固定用例。`
+      : '目前缺少此版本可核对的公开量化成绩。',
+    limit: c.install_block ? '本机试用尚未接入，当前只能归档和查阅资料。'
+      : ready(c) ? '已在本机通过固定用例验证。实际表现随输入和运行配置变化。'
+      : '此版本尚未通过本机验证，效果和速度取决于输入和运行配置。',
+  };
+}
+
+function modelGuide(c) {
+  const task = taskInfo(c.task);
+  const brief = modelSummary(c);
+  const resources = [];
+  if (c.size_bytes) resources.push(size(c.size_bytes));
+  if (c.estimate?.est_ram_mib > 0) resources.push(`预估内存 ${mib(c.estimate.est_ram_mib)}`);
+  if (c.estimate?.est_vram_mib > 0) resources.push(`预估显存 ${mib(c.estimate.est_vram_mib)}`);
+  const adapter = c.task === 'chat' ? 'llama.cpp' : 'MediaPipe';
+  const local = !c.install_block && (c.seed || c.recommended_modes?.some(mode => mode !== 'sota'));
+  const guide = c.integration || (local
+    ? `计划使用 ${adapter} 在本机运行。${trialCopy(task) || '输入文本并接收回答'}。通过离线验证后，可在试用台使用，也可调用 ${c.task === 'chat' ? '/v1/chat/completions' : '/api/infer'}。`
+    : '本机运行方式需另行验证。接入时请以固定版本的上游说明为准。');
+  const files = (c.files || []).filter(f => ['model_card', 'license', 'usage'].includes(f.kind));
+  const chat = c.task === 'chat';
+  const model = c.seed?.id || c.id;
+  const payload = chat ? { model, messages: [{ role: 'user', content: '你好' }] }
+    : { task: c.task, model, inputs: { image: '<图片的 Base64 内容>' } };
+  const inputLabels = { messages: '对话消息', text: '文本', image: '图片', audio: '音频', video: '视频',
+    source_image: '来源图片', target_image: '目标图片' };
+  const inputs = (task?.inputs || []).map(input => inputLabels[input] || input).join('、');
+  const related = [...(c.sota || []), ...(c.public_evidence || [])];
+  const results = modelScores(c);
+  const evidence = (results.length ? results : related).slice(0, 4).map(e => {
+    const url = sourceLink(e.url);
+    const title = esc(e.title || e.source || '公开资料');
+    const value = Number.isFinite(e.value) ? ` · ${esc(e.metric)} ${esc(e.value)}${esc(e.unit || '')}` : '';
+    const rank = e.public_rank ? ` · 榜单第 ${esc(e.public_rank)}` : '';
+    return `<li>${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${title}</a>` : title}${value}${rank}${e.note ? `<small>${esc(e.note)}</small>` : ''}</li>`;
+  }).join('');
+  const measured = c.measured?.[0];
+  const upstream = (c.model_card || '').replace(/^---\s*\r?\n[\s\S]*?\r?\n---[ \t]*\r?\n/, '')
+    .replace(/<!--[\s\S]*?-->|<\/?[a-z][^>]*>/gi, '')
+    .replace(/!\[[^\]]*\]\([^\n)]*\)/g, '')
+    .replace(/\[([^\]\n]+)\]\([^\n)]*\)/g, '$1')
+    .replace(/(?:\r?\n[ \t]*){3,}/g, '\n\n').trim().slice(0, 5400);
+  return `<dl class="model-facts">
+      <div><dt>用途</dt><dd>${esc(brief.ability)}</dd></div>
+      ${inputs ? `<div><dt>输入</dt><dd>${esc(inputs)}</dd></div>` : ''}
+      <div><dt>使用限制</dt><dd>${esc(brief.limit)}</dd></div>
+      <div><dt>版本与许可</dt><dd><code>${esc(c.commit_rev)}</code> · ${esc(c.license || '未确认')}</dd></div>
+      ${resources.length ? `<div><dt>文件与资源</dt><dd>${resources.map(esc).join(' · ')}</dd></div>` : ''}
+    </dl>
+    <h4>公开效果</h4>
+    ${c.review_method ? `<p>${esc(c.review_method)}</p>` : ''}
+    ${evidence ? `<ul>${evidence}</ul>` : ''}
+    ${results.length ? '' : `<p>${esc(c.brief?.effect || '暂无绑定到这个变体的公开量化成绩。可查阅上游资料中的示例和使用限制。')}</p>`}
+    ${c.alternatives?.length ? `<h4>同组比较</h4><ul>${c.alternatives.map(alternative =>
+      `<li><strong>${esc(alternative.variant)}</strong><small>${alternative.evidence.map(e => {
+        const url = sourceLink(e.url);
+        const label = esc(e.title) + ' ' + esc(e.value) + esc(e.unit || '');
+        return url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${label}</a>` : label;
+      }).join(' · ')}</small></li>`).join('')}</ul>` : ''}
+    <h4>本机表现</h4>
+    <p>${measured ? `${c.seed ? '实测' : '历史实测'} · 评测版本 ${esc(measured.eval_version)} · 通过 ${esc(measured.passed_cases)}/${esc(measured.total_cases)} · 中位耗时 ${esc(Math.round(measured.median_latency_ms))} ms` : '暂无本机实测。'}</p>
+    <h4>运行与接入</h4>
+    <p>${esc(guide)}</p>
+    ${sourceLink(c.release_url) ? `<p><a href="${esc(sourceLink(c.release_url))}" target="_blank" rel="noopener noreferrer">官方发布与权重</a></p>` : ''}
+    ${files.length ? `<p>随包资料 <code>${files.map(f => esc(f.repo_path)).join('、')}</code></p>` : ''}
+    ${local ? `<p>验证通过后可发送以下本机请求。Bearer 密钥保存在 <code>data/api-key</code>。</p>
+    <pre>${esc('POST ' + (chat ? '/v1/chat/completions' : '/api/infer') + '\n' + JSON.stringify(payload, null, 2))}</pre>` : ''}
+    ${upstream ? `<details class="upstream-card"><summary>上游模型卡摘录</summary><pre>${esc(upstream)}</pre></details>` : ''}`;
 }
 
 function modelCard(c, bucket) {
   const task = taskInfo(c.task);
-  const status = statusOf(c);
+  const status = bucket === 'pending' ? statusOf(c) : null;
   const job = activeJob(c) || c.jobs?.[0];
-  const metas = [];
-  if (c.size_bytes) metas.push(size(c.size_bytes));
-  if (c.license) metas.push(c.license);
-  if (c.estimate?.est_ram_mib > 0) metas.push(`预估内存 ${mib(c.estimate.est_ram_mib)}`);
-  if (c.estimate?.est_vram_mib > 0) metas.push(`预估显存 ${mib(c.estimate.est_vram_mib)}`);
-  const m = c.measured?.[0];
-  if (m) metas.push(`实测 ${m.quality}${m.median_latency_ms ? ` · ${(m.median_latency_ms / 1000).toFixed(1)}s` : ''}`);
-  const note = c.rationale || c.reason || (c.seed ? '文件已按固定版本保存到本机。' : '来自公开元数据的候选；尚未下载权重。');
-  const reason = c.rationale && c.reason ? `<p class="model-reason">${esc(c.reason)}</p>` : '';
-  const defProfile = profilesFor(c.task)[0];
-  const pref = preferenceFor(c.task);
-  const prefList = profilesFor(c.task);
-  const prefLabel = prefList.length > 1
-    ? `${profileLabels[prefList[0]] || prefList[0]} +${prefList.length - 1}`
-    : (profileLabels[defProfile] || defProfile);
-  const chips = [];
-  if (defProfile) chips.push(`<span class="chip plain">偏好 · ${esc(prefLabel)}</span>`);
-  if (pref.sota_enabled) chips.push('<span class="chip plain">SOTA</span>');
-  if (c.sota?.[0]) chips.push(`<span class="chip">领先 · ${esc(c.sota[0].metric)} ${esc(c.sota[0].value)}</span>`);
-  const path = c.seed?.rel_dir ? `<code class="seed-path">${esc(state.settings?.seeds_dir || 'seeds')}\\${esc(c.seed.rel_dir)}</code>` : '';
-  return `<article class="model-card${ready(c) ? ' is-ready' : ''}">
+  const name = esc(c.variant.replace(/\.gguf$|\.task$/i, ''));
+  const modes = (c.recommended_modes || []).map(mode => esc(profileLabels[mode])).join(' · ');
+  return `<article class="model-card">
     <header class="model-card-head">
       <span class="task-chip">${esc(task?.label || c.task)}</span>
-      <span class="status ${status.cls}">${esc(status.text)}</span>
+      ${status ? `<span class="status ${status.cls}">${esc(status.text)}</span>` : ''}
     </header>
-    <div class="model-title"><h3>${esc(c.variant.replace(/\.gguf$|\.task$/i, ''))}</h3>${chips.join('')}</div>
-    <p class="model-repo">${esc(c.repo)}${metas.length ? ' · ' + metas.map(esc).join(' · ') : ''}</p>
-    <p class="model-note">${esc(note)}</p>
-    ${reason}
+    <h3 title="${name}">${name}</h3>
+    ${modes ? `<p class="model-modes">${modes}</p>` : ''}
     ${job && working(job) ? `<progress max="100" value="${pct(job.progress)}" aria-label="准备进度"></progress>` : ''}
-    ${path}
-    <footer class="model-card-foot"><div class="model-links">${modelLinks(c)}</div><div class="actions">${modelActions(c, bucket)}</div></footer>
+    <footer class="model-card-foot plain-actions">
+      <button class="model-details text-link" type="button" data-model-details="${esc(c.id)}" aria-haspopup="dialog">模型说明与接入</button>
+      ${modelLinks(c)}
+      ${modelActions(c, bucket)}
+    </footer>
   </article>`;
 }
 
 function renderLibrary() {
   if (!state.catalog) return;
-  const buckets = [
-    { id: 'explore', label: '待探索', items: [] },
-    { id: 'pending', label: '待下载', items: [] },
-    { id: 'stored', label: '已落库', items: [] },
-  ];
-  const byId = Object.fromEntries(buckets.map(b => [b.id, b]));
+  const stage = state.libraryStage;
   const candidates = state.catalog.candidates || [];
-  const key = c => `${c.repo}|${c.variant}|${c.task}`;
-  const fixed = new Set(candidates.filter(c => c.commit_rev !== 'main').map(key));
-  candidates.filter(c => c.commit_rev !== 'main' || !fixed.has(key(c))).forEach(c => {
-    if (c.seed) byId.stored.items.push(c);
-    else if (activeJob(c)) byId.pending.items.push(c);
-    else byId.explore.items.push(c);
+  const typeSelect = $('#libraryTask');
+  const chosen = typeSelect.value || '';
+  render('libraryTask', taskOptions());
+  typeSelect.value = chosen;
+  const mode = $('#libraryMode').value;
+  const selectable = candidates.filter(c => !c.reference_only && !c.seed && !activeJob(c) && c.recommended_modes?.length);
+  const ids = new Set(selectable.map(c => c.id));
+  for (const id of state.selected.keys()) if (!ids.has(id)) state.selected.delete(id);
+  const bucket = c => c.seed ? 'stored' : activeJob(c) ? 'pending' : 'explore';
+  const items = candidates.filter(c => bucket(c) === stage && (!chosen || c.task === chosen)
+      && (!mode || [...(c.recommended_modes || []), ...(c.download_profiles || [])].includes(mode)))
+    .sort((a, b) => taskRank(a.task) - taskRank(b.task)
+      || String(a.variant).localeCompare(String(b.variant), 'zh-CN'));
+  state.visibleCandidates = stage === 'explore' ? items.filter(c => ids.has(c.id)) : [];
+  $('#libraryActions').hidden = stage !== 'explore';
+  $('#selectVisible').disabled = state.submitting || !state.visibleCandidates.length;
+  say('selectVisible', state.visibleCandidates.length && state.visibleCandidates.every(c => state.selected.has(c.id))
+    ? '取消全选' : '全选结果');
+  $('#downloadSelected').disabled = state.submitting || !state.selected.size;
+  say('downloadSelected', state.submitting ? '正在提交…' : `下载所选（${state.selected.size}）`);
+  $$('[data-library-stage]').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.dataset.libraryStage === stage));
   });
-  buckets.forEach(b => b.items.sort((a, z) => taskRank(a.task) - taskRank(z.task)
-    || String(a.variant).localeCompare(String(z.variant), 'zh-CN')));
-  const counts = state.status?.counts;
-  say('libraryStatus', counts
-    ? `${counts.offline_ready} 个可试用 · ${counts.active_jobs} 项准备中 · 共 ${buckets.reduce((n, b) => n + b.items.length, 0)} 条记录`
-    : '正在读取种子库');
-  render('librarySections', buckets.map(b => `<section class="library-section" aria-labelledby="bucket-${b.id}">
-    <header class="bucket-head"><h2 id="bucket-${b.id}">${b.label}</h2><span>${b.items.length}</span></header>
-    ${b.items.length ? `<div class="model-grid">${b.items.map(c => modelCard(c, b.id)).join('')}</div>`
-      : `<p class="bucket-empty">${b.id === 'stored' ? '还没有落库的模型。' : b.id === 'pending' ? '没有正在准备的任务。' : '没有等待处理的候选。'}</p>`}
-  </section>`).join(''));
+  say('libraryStatus', `${items.length} 个模型`);
+  const slots = chosen && stage === 'explore' ? Object.entries(profileLabels)
+    .filter(([key]) => !mode || key === mode)
+    .map(([key, label]) => {
+      const found = candidates.find(c => c.task === chosen && c.recommended_modes?.includes(key));
+      const text = found?.reference_only ? '公开评测参考' : found ? { stored: '已落库', pending: '下载中', explore: '待下载' }[bucket(found)] : key === 'sota' ? '暂无可比较的公开成绩' : '暂无合格版本';
+      return `<span class="model-slot${found ? ' found' : ''}">${esc(label)} <small>${text}</small></span>`;
+    }).join('') : '';
+  const empty = { stored: '这里还没有已落库的模型。', pending: '没有匹配的下载作业。', explore: mode === 'sota' ? '暂无匹配的公开领先记录。榜单筛选不限制本机算力。' : '没有匹配的待下载模型。' };
+  render('librarySections', (slots ? `<div class="model-slots">${slots}</div>` : '') +
+    (items.length ? `<div class="model-grid">${items.map(c => modelCard(c, stage)).join('')}</div>`
+      : `<p class="bucket-empty">${empty[stage]}</p>`));
 }
 
 async function download(id, mode) {
@@ -277,6 +406,30 @@ async function download(id, mode) {
     await refresh();
   } catch (e) { toast(e.message); }
   finally { state.pending.delete(id); renderLibrary(); }
+}
+
+async function downloadSelection() {
+  if (state.submitting || !state.selected.size) return;
+  state.submitting = true;
+  let submitted = 0;
+  const errors = [];
+  renderLibrary();
+  try {
+    for (const [id, profile] of state.selected) {
+      const candidate = state.catalog.candidates.find(c => c.id === id);
+      try {
+        await api('/api/downloads', 'POST', {
+          candidate_id: id, task: candidate.task, profile: profile === 'sota' ? 'balanced' : profile,
+          mode: profile === 'sota' ? 'sota' : candidate.install_block ? 'requested' : 'local',
+        });
+        state.selected.delete(id);
+        submitted++;
+      } catch (e) { errors.push(e.message); }
+    }
+    await refresh();
+    toast(`已提交 ${submitted} 项${errors.length ? `，${errors.length} 项未提交：${errors[0]}` : ''}`);
+  } catch (e) { toast(`已提交 ${submitted} 项，目录刷新失败：${e.message}`); }
+  finally { state.submitting = false; renderLibrary(); }
 }
 
 // ---------------------------------------------------------------- 配置
@@ -320,17 +473,18 @@ function renderSettings() {
   $('#removeAgentKey').hidden = !a.configured;
   if (document.activeElement !== $('#agentBaseUrl')) $('#agentBaseUrl').value = s.agent_base_url || '';
   if (document.activeElement !== $('#agentModel')) $('#agentModel').value = s.agent_model || '';
-  say('updateBadge', s.auto_update && s.schedule_enabled ? '自动更新已开启' : '仅手动更新');
+  say('updateBadge', s.auto_update ? '已开启自动下载' : '手动选择下载');
   $('#updateBadge').className = 'status ' + (s.auto_update && s.schedule_enabled ? 'ready' : '');
-  $('#autoUpdate').checked = Boolean(s.auto_update && s.schedule_enabled);
+  $('#autoUpdate').checked = Boolean(s.auto_update);
+  $('#scheduleDiscovery').checked = Boolean(s.schedule_enabled);
   $('#scheduleTime').value = s.schedule_time || '03:00';
   const schedule = state.schedule || {};
   const last = s.effective?.last_attempt || schedule.last_attempt || state.status?.last_sync?.attempt;
   const next = s.effective?.next_run || schedule.next_run;
   say('syncStatus', last ? `上次检查：${new Date(last).toLocaleString('zh-CN', { hour12: false })}` : '还没有检查记录。');
-  say('scheduleStatus', s.auto_update && s.schedule_enabled
+  say('scheduleStatus', s.schedule_enabled
     ? (next ? `下次计划：${new Date(next).toLocaleString('zh-CN', { hour12: false })}` : '计划已开启，等待本机计划任务注册。')
-    : '自动更新已关闭，可随时点“立即更新”。');
+    : '每日查找已关闭，可随时点“立即查找”。');
   say('storageBadge', s.download_root ? '自定义目录' : '默认目录');
   $('#storageBadge').className = 'status ' + (s.download_root ? 'warn' : 'ready');
   if (document.activeElement !== $('#downloadRoot')) $('#downloadRoot').value = s.download_root || '';
@@ -430,12 +584,12 @@ async function saveUpdate(event) {
   say('syncStatus', '正在保存…');
   try {
     state.settings = await api('/api/settings', 'PUT', settingsPayload({
-      auto_update: enabled, schedule_enabled: enabled,
+      auto_update: enabled, schedule_enabled: $('#scheduleDiscovery').checked,
       schedule_time: $('#scheduleTime').value || '03:00',
     }));
     state.schedule = await api('/api/schedule');
     renderSettings();
-    toast(enabled ? '已开启每日自动更新' : '已关闭自动更新');
+    toast(enabled ? '已开启自动下载' : '已关闭自动下载');
   } catch (e) { say('syncStatus', e.message); }
   finally { button.disabled = false; }
 }
@@ -447,7 +601,7 @@ async function manualSync() {
   say('manualSync', '正在更新…');
   say('syncStatus', '正在检查公开来源…');
   try {
-    const report = await api('/api/sync', 'POST');
+    const report = await api('/api/sync?catalog_only=true', 'POST');
     toast(report.status === 'failed' ? '本轮更新未完成'
       : report.status === 'skipped' ? '本轮更新已跳过'
       : report.status === 'partial' ? '已更新可达来源，保留此前目录'
@@ -457,7 +611,7 @@ async function manualSync() {
     state.schedule = await api('/api/schedule');
     renderSettings();
   } catch (e) { say('syncStatus', e.message); }
-  finally { state.sync = false; $('#manualSync').disabled = false; say('manualSync', '立即更新'); }
+  finally { state.sync = false; $('#manualSync').disabled = false; say('manualSync', '立即查找'); }
 }
 
 async function saveStorage() {
@@ -481,33 +635,28 @@ function trialCopy(task) {
 function renderLab() {
   if (!state.catalog) return;
   const available = state.status?.available_now || [];
-  if (!state.labTask || !taskInfo(state.labTask)) {
-    state.labTask = available.find(m => m.task === 'chat')?.task || available[0]?.task || 'chat';
+  if (state.labFilter && !taskInfo(state.labFilter)) state.labFilter = '';
+  const items = available.filter(m => !state.labFilter || m.task === state.labFilter);
+  const first = items.find(m => m.task === 'chat') || items[0];
+  const preferred = state.catalog.defaults.find(p => p.task === first?.task && p.profile === 'balanced');
+  const selected = items.find(m => m.seed_id === state.model)
+    || items.find(m => m.seed_id === preferred?.seed_id) || first;
+  const busy = Boolean(state.chat || state.mediaRunning);
+  if (!busy) {
+    if (state.model && state.model !== selected?.seed_id) clearTrial();
+    state.model = selected?.seed_id || '';
+    state.labTask = selected?.task || state.labFilter;
   }
   const task = taskInfo(state.labTask);
-  const items = available.filter(m => m.task === task.id);
-  if (!items.some(m => m.seed_id === state.model)) {
-    const preferred = state.catalog.defaults.find(p => p.task === task.id && p.profile === 'balanced');
-    state.model = items.find(m => m.seed_id === preferred?.seed_id)?.seed_id || items[0]?.seed_id || '';
-  }
-  const usable = state.catalog.tasks.filter(t => t.enabled || t.id === task.id);
-  const groups = taskGroups().filter(g => usable.some(t => t.group === g));
-  const pendingCount = state.catalog.tasks.length - usable.length;
-  const busy = Boolean(state.chat || state.mediaRunning);
-  render('labTasks', groups.map(group => `<div class="lab-group"><p>${esc(group)}</p><div class="lab-chips">${usable.filter(t => t.group === group).map(t => {
-    const n = available.filter(m => m.task === t.id).length;
-    const meta = n ? `<small aria-label="${n} 个可试用">${n}</small>` : '<small class="none">无可用</small>';
-    return `<button type="button" class="lab-chip" data-lab-task="${esc(t.id)}" ${busy ? 'disabled' : ''} aria-pressed="${t.id === task.id}">${esc(t.label)}${meta}</button>`;
-  }).join('')}</div></div>`).join('') +
-    (pendingCount ? `<p class="lab-note">另有 ${pendingCount} 个类型仍在接入，可在<a href="#/library" data-view="library">模型库</a>查看来源与收藏。</p>` : ''));
-  say('labTaskTitle', task.label);
-  say('labTaskHint', task.enabled ? trialCopy(task) : '此类型的本机试用仍在接入');
-  $('#labModelWrap').hidden = !task.enabled;
-  render('labModel', items.map(m => `<option value="${esc(m.seed_id)}">${esc(m.variant.replace(/\.gguf$|\.task$/i, ''))}</option>`).join('') || '<option value="">暂无离线版本</option>');
+  render('labTasks', taskOptions());
+  $('#labTasks').value = state.labFilter;
+  $('#labTasks').disabled = busy;
+  $('#labModelWrap').hidden = false;
+  render('labModel', items.map(m => `<option value="${esc(m.seed_id)}">${esc(m.variant.replace(/\.gguf$|\.task$/i, ''))}</option>`).join('') || '<option value="">暂无可试用模型</option>');
   $('#labModel').value = state.model;
   $('#labModel').disabled = busy || !state.model;
-  const chat = task.id === 'chat', media = task.id === 'pose' || task.id === 'hand';
-  const has = task.enabled && Boolean(state.model);
+  const chat = task?.id === 'chat', media = task?.id === 'pose' || task?.id === 'hand';
+  const has = task?.enabled && (chat || media) && Boolean(state.model);
   $('#labEmpty').hidden = has;
   $('#chatPanel').hidden = !has || !chat;
   $('#mediaForm').hidden = !has || !media;
@@ -518,13 +667,11 @@ function renderLab() {
   $('#runMedia').disabled = busy || !state.image;
   $('#mediaFile').disabled = busy;
   if (media) say('runMedia', task.id === 'hand' ? '识别手部关键点' : '识别人体关键点');
-  if (!task.enabled) {
-    say('labEmptyTitle', '这个类型的试用待接入');
-    say('labEmptyText', (taskField(task, 'description') || '此类型还没有登记本机运行器。') + '可以先在模型库查看来源或收藏权重。');
-  } else if (!state.model) {
-    const preparing = state.catalog.candidates.some(c => c.task === task.id && c.jobs?.some(working));
-    say('labEmptyTitle', preparing ? '正在准备本机版本' : '还没有可试用的版本');
-    say('labEmptyText', '种子准备好后会自动出现在这里。');
+  if (task && (!task.enabled || !(chat || media))) {
+    say('labEmptyText', `${task.label}尚未接入本机试用，可到模型库查看该类型的模型和资料。`);
+  } else if (!has) {
+    const preparing = state.catalog.candidates.some(c => (!state.labFilter || c.task === state.labFilter) && c.jobs?.some(working));
+    say('labEmptyText', preparing ? '正在准备本机版本。' : '还没有通过本机验证的模型。');
   }
 }
 
@@ -546,7 +693,7 @@ function openTrial(id) {
   if (!item) return;
   if (state.chat || state.mediaRunning) { toast('请等当前试用完成'); return; }
   if (state.model !== id) clearTrial();
-  state.labTask = item.task;
+  state.labFilter = item.task;
   state.model = id;
   renderLab();
   go('lab');
@@ -691,7 +838,7 @@ function refresh() {
   const firstCatalog = !state.catalog;
   state.refresh = api('/api/status').then(async status => {
     if (firstCatalog || state.catalogRevision !== status.catalog_revision) {
-      state.catalog = await api('/api/catalog');
+      state.catalog = await api('/api/catalog?curated=true');
       state.catalogRevision = status.catalog_revision;
     }
     state.status = status;
@@ -707,27 +854,70 @@ function refresh() {
 
 // ---------------------------------------------------------------- 事件
 document.addEventListener('click', event => {
-  const el = event.target.closest('button,a');
+  let el = event.target.closest('button,a');
+  if (!el && !event.target.closest('label,input') && !window.getSelection()?.toString()) {
+    el = event.target.closest('.model-card')?.querySelector('[data-model-details]');
+  }
   if (!el || el.disabled || (el.tagName === 'A' && (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey))) return;
-  if (el.matches('.navigation a,.button.primary,.model-card')) trace(event, el);
-  if (el.dataset.view) {
-    event.preventDefault();
-    go(el.dataset.view);
-  } else if (el.dataset.labTask) {
-    if (state.chat || state.mediaRunning) return;
-    if (el.dataset.labTask !== state.labTask) {
-      state.labTask = el.dataset.labTask;
-      state.model = '';
-      clearTrial();
-      renderLab();
+  if (el.dataset.modelDetails) {
+    const candidate = state.catalog.candidates.find(c => c.id === el.dataset.modelDetails);
+    if (candidate) {
+      const dialog = $('#modelDialog');
+      dialog.dataset.modelId = candidate.id;
+      say('modelDialogTitle', candidate.variant);
+      render('modelDialogBody', modelGuide(candidate));
+      dialog.showModal();
+      $('#modelDialogBody').scrollTop = 0;
     }
+  } else if (el.dataset.view) {
+    event.preventDefault();
+    if (el.id === 'labLibraryLink' && state.catalog) {
+      state.libraryStage = 'explore';
+      $('#libraryTask').value = state.labFilter;
+      $('#libraryMode').value = '';
+      renderLibrary();
+      $('#librarySections').scrollTop = 0;
+    }
+    go(el.dataset.view);
   } else if (el.dataset.try) openTrial(el.dataset.try);
   else if (el.dataset.download) download(el.dataset.download, el.dataset.dmode || 'local');
 });
 window.addEventListener('hashchange', showView);
-document.addEventListener('animationend', event => {
-  if (event.animationName === 'view-arrival') event.target.classList.remove('view-arrival');
+
+$('#modelDialog').addEventListener('close', event => {
+  const id = event.currentTarget.dataset.modelId;
+  const trigger = $('[data-model-details="' + CSS.escape(id) + '"]');
+  (trigger || $('#librarySections')).focus({ preventScroll: true });
 });
+
+for (const button of $$('[data-library-stage]')) {
+  button.addEventListener('click', () => {
+    state.libraryStage = button.dataset.libraryStage;
+    $('#librarySections').scrollTop = 0;
+    renderLibrary();
+  });
+}
+for (const id of ['libraryTask', 'libraryMode']) {
+  $('#' + id).addEventListener('change', renderLibrary);
+}
+$('#librarySections').addEventListener('change', event => {
+  const id = event.target.dataset.selectModel;
+  if (!id) return;
+  if (event.target.checked) state.selected.set(id, selectionMode(state.catalog.candidates.find(c => c.id === id)));
+  else state.selected.delete(id);
+  renderLibrary();
+  const checkbox = $('[data-select-model="' + CSS.escape(id) + '"]');
+  checkbox?.focus({ preventScroll: true });
+});
+$('#selectVisible').addEventListener('click', () => {
+  const clear = state.visibleCandidates.every(c => state.selected.has(c.id));
+  for (const c of state.visibleCandidates) {
+    if (clear) state.selected.delete(c.id);
+    else if (!state.selected.has(c.id)) state.selected.set(c.id, selectionMode(c));
+  }
+  renderLibrary();
+});
+$('#downloadSelected').addEventListener('click', downloadSelection);
 
 $('#preferenceRows').addEventListener('change', event => {
   const row = event.target.closest('.pref-row');
@@ -758,6 +948,11 @@ $('#removeAgentKey').addEventListener('click', async () => {
   } catch (e) { say('serviceStatus', e.message); }
 });
 
+$('#labTasks').addEventListener('change', event => {
+  if (state.chat || state.mediaRunning) return;
+  state.labFilter = event.target.value;
+  renderLab();
+});
 $('#labModel').addEventListener('change', e => { state.model = e.target.value; clearTrial(); renderLab(); });
 $('#newChat').addEventListener('click', () => { clearTrial(); $('#chatInput').focus(); });
 $('#chatForm').addEventListener('submit', sendChat);
@@ -778,9 +973,10 @@ async function connect() {
     state.initialized = true;
   } catch (e) {
     say('connectionText', '本机服务暂未连接');
+    $('.connection').dataset.state = 'error';
     if (!state.catalog) say('libraryStatus', '正在等待本机服务');
   }
 }
-showView();
+showView(false);
 connect();
 setInterval(connect, 4500);

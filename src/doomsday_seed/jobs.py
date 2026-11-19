@@ -27,11 +27,12 @@ from .evaluation import Evaluator
 from .locks import LockBusy, file_lock
 from .hardware import check_capacity, estimate_footprint, probe as probe_hardware
 from .models import (PROFILES, Candidate, EvaluationRecord, FileSpec, HardwareSample, Job, RuntimeConfig,
-                     Seed, SyncReport, utc_now)
+                     Seed, Settings, SyncReport, utc_now)
 from .preselect import PreSelector, ShortlistResult
 from .runner import InferenceService, RuntimeUnavailable
 from .runtime_registry import RuntimeRegistry
 from . import media
+from .researcher import refresh_reviews
 
 
 class SyncBusy(Exception):
@@ -83,21 +84,31 @@ class JobPipeline:
                     self.db.set_meta("last_sync_attempt", utc_now())
                     self.db.set_meta("last_sync_skip_reason", report.message)
                     return report
-                if not settings.auto_update and trigger == "scheduled":
-                    report.status = "skipped"
-                    report.message = "自动更新已关闭"
-                    report.skipped.append({"reason": "自动更新已关闭"})
-                    return report
                 self.db.set_meta("last_sync_attempt", utc_now())
-                result = self.source.discover(settings)
+                curated = catalog_only or not settings.auto_update or trigger in {"scheduled", "catchup"}
+                result = self.source.discover_library(settings) if curated else self.source.discover(settings)
                 result.candidates.extend(media.candidates())
-                if catalog_only:
+                if curated:
                     self.preselector.store_discovery(result, settings)
+                    if self.source.supports_public_reviews:
+                        refresh_reviews(self.db)
                     report.discovered = len(result.candidates)
+                    sample = self.hardware()
+                    self.db.save_sample(sample)
+                    models = self.db.list_candidates()
+                    slots = self.preselector.recommendations(models, sample, settings, sota_leaders(models))
+                    report.shortlisted = list(dict.fromkeys(
+                        candidate_id for choices in slots.values() for candidate_id in choices.values()))
+                    recommended_ids = set(report.shortlisted)
+                    self.source.cache_model_cards([c for c in models if c.id in recommended_ids])
+                    current = self.db.get_settings()
+                    if current.auto_update and current.schedule_enabled and not current.simulated_offline and not catalog_only:
+                        report.jobs = self._queue_recommendations(slots, current, report)
                     report.status = "partial" if result.errors else "ok"
-                    self.db.set_meta("last_sync_attempt", utc_now())
+                    self.db.set_meta("last_sync_status", report.status)
                     if not result.errors:
                         self.db.set_meta("last_sync_success", utc_now())
+                    self._start_worker(report.jobs, wait=wait)
                     return report
                 local_pairs = settings.active_pairs()
                 if any(task == "chat" for task, _ in local_pairs):
@@ -168,6 +179,33 @@ class JobPipeline:
             self.db.finish_sync(report)
             self._last_report = report
         return report
+
+    def _queue_recommendations(self, slots: dict[str, dict[str, str]], settings: Settings,
+                               report: SyncReport) -> list[str]:
+        selected = [(task, profile) for task, profile in settings.active_pairs()]
+        selected.extend((task, "sota") for task in slots
+                        if task in settings.sota_subscriptions or settings.download_modes.get(task) == "sota")
+        existing = {seed.candidate_id for seed in self.db.list_seeds()}
+        existing.update(job.candidate_id for job in self.db.list_jobs(limit=-1))
+        jobs = []
+        for task, profile in selected:
+            candidate_id = slots.get(task, {}).get(profile)
+            if not candidate_id or candidate_id in existing:
+                continue
+            existing.add(candidate_id)
+            candidate = self.db.get_candidate(candidate_id)
+            mode = "local" if local_adapter(candidate) else "requested"
+            if profile == "sota":
+                mode = "sota"
+            try:
+                job = self.submit_download(candidate_id, task, "balanced" if profile == "sota" else profile,
+                                           mode=mode, autostart=False)
+            except ValueError as exc:
+                report.skipped.append({"candidate_id": candidate_id, "reason": str(exc)})
+                continue
+            if job.state == "queued":
+                jobs.append(job.id)
+        return jobs
 
     def _enqueue(self, shortlist: ShortlistResult, sync_id: str) -> list[str]:
         job_ids: list[str] = []

@@ -25,6 +25,7 @@ from .downloader import sha256_file
 from .models import (JOB_STATE_LABELS, PROFILES, STATE_ICONS, STATE_LABELS,
                      ChatCompletionRequest, ChatMessage, Settings, utc_now)
 from .runner import RuntimeUnavailable
+from .researcher import model_reviews
 from . import media
 from .agent import AgentUnavailable, DeepSeekClient
 
@@ -36,7 +37,7 @@ def get_service(request: Request):
 
 
 class SettingsPayload(BaseModel):
-    auto_update: bool = True
+    auto_update: bool = False
     schedule_enabled: bool = True
     schedule_time: str = Field(default="03:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     agent_enabled: bool = True
@@ -191,6 +192,7 @@ def get_hardware(service=Depends(get_service)):
 @router.get("/api/catalog")
 def catalog(task: str | None = None, profile: str | None = None,
             state: str | None = None, mode: Literal["local", "sota"] = "local",
+            curated: bool = False,
             service=Depends(get_service)):
     db = service.db
     if task and task not in TASKS:
@@ -204,9 +206,19 @@ def catalog(task: str | None = None, profile: str | None = None,
     seeds_by_id = {seed.id: seed for seed in seeds}
     seeds_by_candidate = {seed.candidate_id: seed for seed in reversed(seeds)}
     latest_by_candidate = {record.candidate_id: record for record in db.list_evaluations(latest_only=True)}
+    pointers = db.list_defaults()
     jobs_by_candidate = {}
     for job in db.list_jobs(limit=200):
         jobs_by_candidate.setdefault(job.candidate_id, []).append(job)
+    recommended = {}
+    if curated:
+        slots = service.preselector.recommendations(
+            all_candidates, db.latest_sample() or service.hardware(), db.get_settings(), rankings)
+        for choices in slots.values():
+            for slot, candidate_id in choices.items():
+                recommended.setdefault(candidate_id, []).append(slot)
+        candidates = [c for c in candidates if c.id in recommended or c.id in seeds_by_candidate
+                      or any(job.state not in {"done", "failed"} for job in jobs_by_candidate.get(c.id, []))]
     items = []
     for c in candidates:
         seed = seeds_by_candidate.get(c.id)
@@ -214,8 +226,18 @@ def catalog(task: str | None = None, profile: str | None = None,
             continue
         related_jobs = jobs_by_candidate.get(c.id, [])[:5]
         latest = latest_by_candidate.get(c.id)
+        profiles = {a["profile"] for j in related_jobs for a in j.payload.get("assignments", [])
+                    if a.get("profile") in PROFILES}
+        if seed:
+            profiles.update(p.profile for p in pointers if p.seed_id == seed.id)
+        if any(j.payload.get("mode") == "sota" for j in related_jobs) or (
+                seed and seed.manifest.get("collection_mode") == "sota"):
+            profiles.add("sota")
         items.append({
             **c.model_dump(),
+            "recommended_modes": recommended.get(c.id, []),
+            "model_card": db.get_meta(f"model-card:{c.repo}:{c.commit_rev}")[:8192] if curated else "",
+            "download_profiles": sorted(profiles),
             "state_label": STATE_LABELS.get(c.state, c.state),
             "state_icon": STATE_ICONS.get(c.state, ""),
             "install_block": (
@@ -246,8 +268,18 @@ def catalog(task: str | None = None, profile: str | None = None,
                       "progress": j.progress, "message": j.message} for j in related_jobs],
             "download_progress": (max((j.progress for j in related_jobs), default=0.0)),
         })
+    if curated and not profile and state in (None, "candidate"):
+        ranked_tasks = {item["task"] for item in items if "sota" in item["recommended_modes"]}
+        for reference in model_reviews(db):
+            if reference["task"] in ranked_tasks or (task and reference["task"] != task):
+                continue
+            items.append({
+                **reference, "id": "research-" + reference["task"], "source": "research",
+                "reference_only": True, "recommended_modes": ["sota"], "state": "candidate",
+                "public_evidence": reference["evidence"], "install_block": "公开评测参考",
+            })
     defaults = []
-    for pointer in db.list_defaults():
+    for pointer in pointers:
         seed = seeds_by_id.get(pointer.seed_id)
         defaults.append({**pointer.model_dump(),
                          "variant": seed.manifest.get("variant") if seed else None,
